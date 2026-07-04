@@ -411,6 +411,13 @@ write_export <- function(df, file) {
   readr::write_csv(as.data.frame(df), file, na = "")
 }
 
+# Case-insensitive literal search so characters like ( [ * typed by the user
+# are matched as text instead of being interpreted as a regular expression.
+search_matches <- function(search_value, ...) {
+  blob <- paste(..., sep = " | ")
+  grepl(tolower(search_value), tolower(blob), fixed = TRUE)
+}
+
 make_choice_vector <- function(x) {
   x <- as.character(x)
   x <- unique(stats::na.omit(x))
@@ -728,7 +735,7 @@ surgical_date_lookup <- surgical_data %>%
     .groups = "drop"
   )
 
-prepare_prom_data <- function(prom_type) {
+build_prom_data <- function(prom_type) {
   df <- switch(
     prom_type,
     knee = oks,
@@ -753,7 +760,19 @@ prepare_prom_data <- function(prom_type) {
   df
 }
 
-prepare_postop_complication_data <- function(source_choice = "all") {
+# The source data is fixed for the lifetime of the session, so the joined PROM
+# datasets are built once here instead of on every reactive invalidation.
+prom_data_cache <- list(
+  knee = build_prom_data("knee"),
+  hip = build_prom_data("hip"),
+  eq5d = build_prom_data("eq5d")
+)
+
+prepare_prom_data <- function(prom_type) {
+  prom_data_cache[[prom_type]]
+}
+
+build_postop_complication_data <- function(source_choice = "all") {
   df <- switch(
     source_choice,
     V1 = get_complications_v1(),
@@ -777,11 +796,21 @@ prepare_postop_complication_data <- function(source_choice = "all") {
     )
 }
 
+postop_complication_cache <- list(
+  all = build_postop_complication_data("all"),
+  V1 = build_postop_complication_data("V1"),
+  V2 = build_postop_complication_data("V2")
+)
+
+prepare_postop_complication_data <- function(source_choice = "all") {
+  postop_complication_cache[[source_choice]]
+}
+
 prepare_complication_data <- prepare_postop_complication_data
-all_postop_complications <- prepare_postop_complication_data("all")
+all_postop_complications <- postop_complication_cache$all
 all_complications <- all_postop_complications
 
-prepare_periop_complication_data <- function(source_choice = "all") {
+build_periop_complication_data <- function(source_choice = "all") {
   df <- periop_complications_raw
   if (identical(source_choice, "V1")) {
     df <- df %>% filter(source == "Peri-op V1")
@@ -805,7 +834,19 @@ prepare_periop_complication_data <- function(source_choice = "all") {
     )
 }
 
-all_periop_complications <- prepare_periop_complication_data("all")
+periop_complication_cache <- list(
+  all = build_periop_complication_data("all"),
+  V1 = build_periop_complication_data("V1"),
+  V2 = build_periop_complication_data("V2")
+)
+
+prepare_periop_complication_data <- function(source_choice = "all") {
+  periop_complication_cache[[source_choice]]
+}
+
+all_periop_complications <- periop_complication_cache$all
+
+combined_complications_for_lookup <- bind_rows(all_periop_complications, all_postop_complications)
 
 surgical_enriched <- surgical_data %>%
   mutate(
@@ -1391,7 +1432,9 @@ ui <- navbarPage(
       tags$li("PROMs and complication date filters that use procedure date when linked, otherwise the native event / assessment date."),
       tags$li("Consultant is sourced from the peri-op assessment where linked to the case, and surgeon grade is available across the main outcome tabs."),
       tags$li("Separate peri-op and post-op complication tabs, each with count or rate displays and comparison by consultant, surgeon grade, fixation, knee system, femoral component, and acetabular component."),
-      tags$li("A BMI histogram in the demographics tab, with BMI populated from pre-op where the case IDs link.")
+      tags$li("A BMI histogram in the demographics tab, with BMI populated from pre-op where the case IDs link."),
+      tags$li("Faster filtering: the linked PROM and complication datasets are prepared once at startup instead of being rebuilt every time a filter changes."),
+      tags$li("Search boxes match text literally and wait briefly after typing, so characters such as brackets no longer cause errors and tables refresh less often.")
     ),
     tags$h4("Using the dummy files"),
     tags$ul(
@@ -1406,6 +1449,11 @@ ui <- navbarPage(
 )
 
 server <- function(input, output, session) {
+
+  # Debounce the free-text search boxes so tables and plots refresh once the
+  # user pauses typing, rather than on every keystroke.
+  cases_search_value <- debounce(reactive(trimws(input$cases_search %||% "")), 400)
+  impl_search_value <- debounce(reactive(trimws(input$impl_search %||% "")), 400)
 
   output$overview_notice <- renderUI({
     registry_note <- if (nrow(periop_cases_enriched) > 0) {
@@ -1483,16 +1531,16 @@ server <- function(input, output, session) {
     df <- apply_single_filter(df, "Laterality", input$cases_laterality)
     df <- apply_single_filter(df, "Procedure type", input$cases_proc)
 
-    search_value <- trimws(input$cases_search %||% "")
+    search_value <- cases_search_value()
     if (!identical(search_value, "")) {
-      search_blob <- paste(
+      keep <- search_matches(
+        search_value,
         df$FORM_RESPONSE_GROUP_ID,
         df$`MRN Number`,
         df$`First Name`,
-        df$`Last Name`,
-        sep = " | "
+        df$`Last Name`
       )
-      df <- df[grepl(search_value, search_blob, ignore.case = TRUE), , drop = FALSE]
+      df <- df[keep, , drop = FALSE]
     }
 
     df
@@ -2564,16 +2612,16 @@ server <- function(input, output, session) {
     df <- apply_component_filter(df, "acetabular_component", input$impl_acetabular_component)
     df <- apply_single_filter(df, "MANUFACTURER_NAME", input$impl_manufacturer)
 
-    search_value <- trimws(input$impl_search %||% "")
+    search_value <- impl_search_value()
     if (!identical(search_value, "")) {
-      search_blob <- paste(
+      keep <- search_matches(
+        search_value,
         df$DESCRIPTION,
         df$`Brand Name`,
         df$`Brand Model`,
-        df$CATALOGUE_NUMBER,
-        sep = " | "
+        df$CATALOGUE_NUMBER
       )
-      df <- df[grepl(search_value, search_blob, ignore.case = TRUE), , drop = FALSE]
+      df <- df[keep, , drop = FALSE]
     }
 
     df
@@ -2703,7 +2751,7 @@ server <- function(input, output, session) {
     content = function(file) write_export(filtered_implants(), file)
   )
 
-  lookup_value <- reactive(trimws(input$lookup_value %||% ""))
+  lookup_value <- debounce(reactive(trimws(input$lookup_value %||% "")), 400)
 
   lookup_results <- reactive({
     value <- lookup_value()
@@ -2715,7 +2763,7 @@ server <- function(input, output, session) {
         knee = prepare_prom_data("knee")[0, , drop = FALSE],
         hip = prepare_prom_data("hip")[0, , drop = FALSE],
         eq5d = prepare_prom_data("eq5d")[0, , drop = FALSE],
-        complications = bind_rows(all_periop_complications, all_postop_complications)[0, , drop = FALSE],
+        complications = combined_complications_for_lookup[0, , drop = FALSE],
         surgical = surgical_enriched[0, , drop = FALSE],
         implants = implant_joined[0, , drop = FALSE],
         classification = implant_classification[0, , drop = FALSE]
@@ -2736,7 +2784,7 @@ server <- function(input, output, session) {
       knee = filter_exact_field(prepare_prom_data("knee"), field, value),
       hip = filter_exact_field(prepare_prom_data("hip"), field, value),
       eq5d = filter_exact_field(prepare_prom_data("eq5d"), field, value),
-      complications = filter_exact_field(bind_rows(all_periop_complications, all_postop_complications), field, value),
+      complications = filter_exact_field(combined_complications_for_lookup, field, value),
       surgical = filter_exact_field(surgical_enriched, field, value),
       implants = filter_exact_field(implant_joined, field, value),
       classification = class_df

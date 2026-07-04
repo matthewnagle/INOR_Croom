@@ -22,6 +22,17 @@ The app now includes:
   - **rates (% of eligible cases)**
 - a **BMI histogram** on the **Cases & demographics** tab
 
+### Performance and robustness updates
+
+- the linked PROM and complication datasets are now built **once at startup** and
+  reused by every filter, plot, and lookup, instead of being re-joined on each
+  interaction — tabs respond noticeably faster on larger extracts
+- the free-text search boxes (cases, implants, lookup) now:
+  - match the typed text **literally**, so characters like `(`, `[` or `*` no
+    longer trigger a regular-expression error
+  - **debounce** input (400 ms), so tables refresh when you pause typing rather
+    than on every keystroke
+
 ## Important note about the dummy extracts
 
 Your dummy files do **not** share linked `FORM_RESPONSE_GROUP_ID` values across all datasets.
