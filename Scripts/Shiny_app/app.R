@@ -359,6 +359,16 @@ if (exists("preop", inherits = FALSE) && is.data.frame(preop)) {
 
 stage_order <- c(
   "Pre-op presentation", "6 month presentation", "1 year presentation",
+  "2 year presentation", "5 year presentation", "10 year presentation",
+  "Extraordinary presentation"
+)
+
+# Stages used for pre-op vs post-op change analysis. "Extraordinary
+# presentation" is deliberately excluded: it is an unscheduled review, not a
+# fixed follow-up point, so it cannot be pooled with the timed reviews.
+prom_preop_stage <- "Pre-op presentation"
+prom_followup_stages <- c(
+  "6 month presentation", "1 year presentation",
   "2 year presentation", "5 year presentation", "10 year presentation"
 )
 
@@ -553,7 +563,8 @@ rename_group_column <- function(df, label) {
   df
 }
 
-summarise_scores <- function(df, group_cols = NULL, score_col = "Score") {
+summarise_scores <- function(df, group_cols = NULL, score_col = "Score",
+                             pass_threshold = NULL, digits = 1) {
   if (is.null(df) || nrow(df) == 0 || !score_col %in% names(df)) {
     return(data.frame())
   }
@@ -565,16 +576,299 @@ summarise_scores <- function(df, group_cols = NULL, score_col = "Score") {
     df <- df %>% group_by(across(all_of(group_cols)))
   }
 
-  df %>%
+  out <- df %>%
     summarise(
       n = n(),
-      mean = round(mean(.data[[score_col]], na.rm = TRUE), 1),
+      mean = round(mean(.data[[score_col]], na.rm = TRUE), digits),
       median = median(.data[[score_col]], na.rm = TRUE),
-      sd = round(sd(.data[[score_col]], na.rm = TRUE), 1),
+      sd = round(sd(.data[[score_col]], na.rm = TRUE), digits),
       min = min(.data[[score_col]], na.rm = TRUE),
       max = max(.data[[score_col]], na.rm = TRUE),
+      `PASS (%)` = pass_rate(.data[[score_col]], pass_threshold),
       .groups = "drop"
     )
+
+  if (is.null(pass_threshold) || length(pass_threshold) != 1 || is.na(pass_threshold)) {
+    out[["PASS (%)"]] <- NULL
+  }
+
+  out
+}
+
+# -----------------------------------------------------------------------------
+# Pre-op vs post-op change helpers
+# -----------------------------------------------------------------------------
+# All three PROMs in this app run "higher is better" (OKS 0-48, OHS 0-48,
+# EQ-5D index up to 1.0), so change = follow-up score - pre-op score and a
+# positive change is an improvement.
+
+# Minimal clinically important difference defaults — the individual-patient
+# (ROC-derived) values, since the app reports the proportion of individual
+# patients achieving a meaningful improvement.
+#   OKS 7 and OHS 8: Beard et al., J Clin Epidemiol 2015;68(1):73-79.
+#   EQ-5D index 0.074: Walters & Brazier, Qual Life Res 2005.
+prom_default_mcid <- function(prom_type) {
+  switch(prom_type, knee = 7, hip = 8, eq5d = 0.074, 0)
+}
+
+# Patient acceptable symptom state (PASS) defaults — the score at or above which
+# a patient rates their state as acceptable. Unlike the MCID this is an absolute
+# post-op score, so it needs no pre-op baseline.
+#   OKS 30 at 12 and 24 months (27 at 3 months):
+#     Ingelsrud et al., Acta Orthop 2020;92(1):85-90.
+#   OHS 40 at 1 year (34 at 3 months, 39 at 2 years):
+#     Galea et al., Acta Orthop 2020;91(4):372-377.
+#   EQ-5D index 0.8 at 12 months — reported thresholds run 0.68 to 0.85
+#     depending on the value set used:
+#     Conner-Spady et al., Qual Life Res 2022 (doi:10.1007/s11136-022-03287-9).
+# Published thresholds drift with follow-up length and case mix, so the app
+# treats these as editable defaults rather than fixed truths.
+prom_default_pass <- function(prom_type) {
+  switch(prom_type, knee = 30, hip = 40, eq5d = 0.8, NA_real_)
+}
+
+prom_pass_reference_note <- function(prom_type) {
+  switch(
+    prom_type,
+    knee = "Published OKS thresholds: 27 at 3 months, 30 at 12 and 24 months (Ingelsrud, Acta Orthop 2020).",
+    hip = "Published OHS thresholds: 34 at 3 months, 40 at 1 year, 39 at 2 years (Galea, Acta Orthop 2020).",
+    eq5d = "Published EQ-5D index thresholds run 0.68 to 0.85 depending on the value set (Conner-Spady, Qual Life Res 2022).",
+    ""
+  )
+}
+
+# PASS describes a post-operative state, so headline rates and group comparisons
+# are computed over follow-up records only. Including pre-op rows (where almost
+# nobody is in an acceptable state) would drag every rate down, and would let a
+# group's stage mix masquerade as a difference in outcome.
+prom_postop_records <- function(df) {
+  if (is.null(df) || nrow(df) == 0 || !"Stage" %in% names(df)) return(df)
+  df %>% filter(as.character(Stage) %in% prom_followup_stages)
+}
+
+# Share of records at or above the PASS threshold. Returns NA rather than 0 when
+# there is nothing to judge, so an empty cohort never reads as "0% acceptable".
+pass_rate <- function(x, threshold) {
+  if (length(threshold) != 1 || is.na(threshold)) return(NA_real_)
+  x <- x[!is.na(x)]
+  if (!length(x)) return(NA_real_)
+  round(100 * mean(x >= threshold), 1)
+}
+
+prom_score_digits <- function(prom_type) {
+  if (identical(prom_type, "eq5d")) 3L else 2L
+}
+
+prom_score_label <- function(prom_type) {
+  switch(
+    prom_type,
+    knee = "Oxford Knee Score",
+    hip = "Oxford Hip Score",
+    eq5d = "EQ-5D index",
+    "Score"
+  )
+}
+
+# Cases are keyed by FORM_RESPONSE_GROUP_ID, but a handful of dummy records
+# reuse an ID across both sides, so pair on side as well. EQ-5D carries no
+# laterality at all.
+prom_pair_side <- function(df) {
+  if (!"Laterality" %in% names(df)) return(rep("Not recorded", nrow(df)))
+  side <- trimws(as.character(df$Laterality))
+  side[is.na(side) | !nzchar(side) | side == "None"] <- "Not recorded"
+  side
+}
+
+# Collapse repeat submissions so each case / side / stage contributes one score.
+# Pre-op keeps the LAST record (closest to surgery); a follow-up stage keeps the
+# FIRST record at that stage (closest to the nominal review point).
+collapse_prom_records <- function(df) {
+  if (is.null(df) || nrow(df) == 0 || !"Score" %in% names(df)) return(NULL)
+
+  df <- df %>% filter(!is.na(Score), !is.na(Stage))
+  if (nrow(df) == 0) return(NULL)
+
+  df$pair_side <- prom_pair_side(df)
+  df$stage_label <- as.character(df$Stage)
+  df$record_date <- if ("event_date_parsed" %in% names(df)) {
+    dplyr::coalesce(df$event_date_parsed, df$analysis_date)
+  } else {
+    df$analysis_date
+  }
+
+  df <- df %>% filter(stage_label %in% c(prom_preop_stage, prom_followup_stages))
+  if (nrow(df) == 0) return(NULL)
+
+  df %>%
+    mutate(sort_date = dplyr::if_else(is.na(record_date), as.Date("1900-01-01"), record_date)) %>%
+    group_by(FORM_RESPONSE_GROUP_ID, pair_side, stage_label) %>%
+    arrange(sort_date, .by_group = TRUE) %>%
+    slice(if (identical(dplyr::first(stage_label), prom_preop_stage)) dplyr::n() else 1L) %>%
+    ungroup() %>%
+    select(-sort_date)
+}
+
+# Pair each follow-up record back to the same case/side pre-op baseline.
+# Metadata (consultant, implant, hospital) is carried from the follow-up row so
+# the existing comparison groupings work unchanged.
+build_prom_change_data <- function(df, followup_stages = prom_followup_stages) {
+  collapsed <- collapse_prom_records(df)
+  if (is.null(collapsed) || nrow(collapsed) == 0) return(data.frame())
+
+  baseline <- collapsed %>%
+    filter(stage_label == prom_preop_stage) %>%
+    select(
+      FORM_RESPONSE_GROUP_ID,
+      pair_side,
+      preop_score = Score,
+      preop_date = record_date
+    )
+
+  followup <- collapsed %>% filter(stage_label %in% followup_stages)
+
+  if (nrow(baseline) == 0 || nrow(followup) == 0) return(data.frame())
+
+  followup %>%
+    inner_join(baseline, by = c("FORM_RESPONSE_GROUP_ID", "pair_side")) %>%
+    mutate(
+      followup_stage = factor(stage_label, levels = prom_followup_stages, ordered = TRUE),
+      followup_score = Score,
+      followup_date = record_date,
+      change = followup_score - preop_score,
+      days_from_preop = as.numeric(followup_date - preop_date)
+    ) %>%
+    arrange(followup_stage, FORM_RESPONSE_GROUP_ID)
+}
+
+# Count cases that could not be paired, so an unpaired cohort is never silently
+# dropped from the headline numbers.
+prom_pairing_counts <- function(df, followup_stage) {
+  empty <- list(paired = 0L, preop_only = 0L, followup_only = 0L)
+  collapsed <- collapse_prom_records(df)
+  if (is.null(collapsed) || nrow(collapsed) == 0 || is.null(followup_stage)) return(empty)
+
+  key <- function(x) paste(x$FORM_RESPONSE_GROUP_ID, x$pair_side, sep = "|")
+  pre_keys <- unique(key(collapsed %>% filter(stage_label == prom_preop_stage)))
+  post_keys <- unique(key(collapsed %>% filter(stage_label == followup_stage)))
+
+  list(
+    paired = length(intersect(pre_keys, post_keys)),
+    preop_only = length(setdiff(pre_keys, post_keys)),
+    followup_only = length(setdiff(post_keys, pre_keys))
+  )
+}
+
+mean_ci_bounds <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2) return(c(NA_real_, NA_real_))
+  se <- stats::sd(x) / sqrt(length(x))
+  if (!is.finite(se)) return(c(NA_real_, NA_real_))
+  if (se == 0) return(c(mean(x), mean(x)))
+  tcrit <- stats::qt(0.975, df = length(x) - 1)
+  mean(x) + c(-1, 1) * tcrit * se
+}
+
+paired_p_value <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 2 || !is.finite(stats::sd(x)) || stats::sd(x) == 0) return(NA_real_)
+  stats::t.test(x)$p.value
+}
+
+format_p_value <- function(p) {
+  if (length(p) != 1 || is.na(p)) return("NA")
+  if (p < 0.001) return("<0.001")
+  formatC(p, format = "f", digits = 3)
+}
+
+format_change_value <- function(x, digits = 2) {
+  if (length(x) != 1 || is.na(x)) return("NA")
+  paste0(if (x > 0) "+" else "", formatC(x, format = "f", digits = digits))
+}
+
+# One summary row per group: paired n, both means, the change with a 95% CI,
+# the proportions improved / worse / meeting MCID, and a paired t-test.
+summarise_prom_change <- function(df, group_cols = NULL, mcid = 0, digits = 2,
+                                  pass_threshold = NULL) {
+  if (is.null(df) || nrow(df) == 0 || !"change" %in% names(df)) return(data.frame())
+
+  df <- df %>% filter(!is.na(change), !is.na(preop_score), !is.na(followup_score))
+  if (nrow(df) == 0) return(data.frame())
+
+  if (!is.null(group_cols) && length(group_cols) > 0) {
+    df <- df %>% group_by(across(all_of(group_cols)))
+  }
+
+  out <- df %>%
+    summarise(
+      `Paired cases` = dplyr::n(),
+      `Mean pre-op` = round(mean(preop_score, na.rm = TRUE), digits),
+      `Mean follow-up` = round(mean(followup_score, na.rm = TRUE), digits),
+      `Mean change` = round(mean(change, na.rm = TRUE), digits),
+      `CI low` = round(mean_ci_bounds(change)[[1]], digits),
+      `CI high` = round(mean_ci_bounds(change)[[2]], digits),
+      `SD change` = round(stats::sd(change, na.rm = TRUE), digits),
+      `Median change` = round(stats::median(change, na.rm = TRUE), digits),
+      `Improved (%)` = round(100 * mean(change > 0, na.rm = TRUE), 1),
+      `Met MCID (%)` = round(100 * mean(change >= mcid, na.rm = TRUE), 1),
+      `Worse (%)` = round(100 * mean(change < 0, na.rm = TRUE), 1),
+      `PASS (%)` = pass_rate(followup_score, pass_threshold),
+      `p value` = format_p_value(paired_p_value(change)),
+      .groups = "drop"
+    )
+
+  if (is.null(pass_threshold) || length(pass_threshold) != 1 || is.na(pass_threshold)) {
+    out[["PASS (%)"]] <- NULL
+  }
+
+  out
+}
+
+# Cross-tabulate the two responder definitions. They answer different questions —
+# MCID asks "did this patient gain enough?", PASS asks "is this patient's state
+# acceptable now?" — and a patient starting from a very low baseline can gain a
+# great deal and still fall short of an acceptable state.
+responder_matrix <- function(df, mcid, pass_threshold) {
+  if (is.null(df) || nrow(df) == 0) return(data.frame())
+  if (length(pass_threshold) != 1 || is.na(pass_threshold)) return(data.frame())
+
+  df <- df %>% filter(!is.na(change), !is.na(followup_score))
+  if (nrow(df) == 0) return(data.frame())
+
+  counts <- df %>%
+    mutate(
+      met_mcid = change >= mcid,
+      met_pass = followup_score >= pass_threshold
+    ) %>%
+    count(met_mcid, met_pass, name = "Cases")
+
+  total <- sum(counts$Cases)
+  label_for <- function(met_mcid, met_pass) {
+    dplyr::case_when(
+      met_mcid & met_pass ~ "Met MCID and PASS",
+      met_mcid & !met_pass ~ "Met MCID only (improved, state still not acceptable)",
+      !met_mcid & met_pass ~ "Met PASS only (already close to acceptable)",
+      TRUE ~ "Met neither"
+    )
+  }
+
+  order_levels <- c(
+    "Met MCID and PASS",
+    "Met MCID only (improved, state still not acceptable)",
+    "Met PASS only (already close to acceptable)",
+    "Met neither"
+  )
+
+  counts %>%
+    mutate(Outcome = label_for(met_mcid, met_pass)) %>%
+    group_by(Outcome) %>%
+    summarise(Cases = sum(Cases), .groups = "drop") %>%
+    tidyr::complete(Outcome = order_levels, fill = list(Cases = 0)) %>%
+    mutate(
+      `% of paired cases` = round(100 * Cases / total, 1),
+      Outcome = factor(Outcome, levels = order_levels)
+    ) %>%
+    arrange(Outcome) %>%
+    mutate(Outcome = as.character(Outcome))
 }
 
 summarise_duration <- function(df, group_cols = NULL) {
@@ -1024,6 +1318,7 @@ ui <- navbarPage(
        .notice-box{background:#fff7ed;border-left:4px solid #f59e0b;padding:12px 14px;border-radius:8px;margin-bottom:16px;}
        .success-box{background:#ecfdf5;border-left:4px solid #10b981;padding:12px 14px;border-radius:8px;margin-bottom:16px;}
        .help-note{color:#64748b;font-size:13px;}
+       .control-heading{font-size:12px;font-weight:700;color:#5b6472;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px;}
        .tab-content{padding-top:12px;}"
     ))
   ),
@@ -1116,6 +1411,23 @@ ui <- navbarPage(
           choices = NULL,
           options = list(placeholder = "Select a case ID")
         ),
+        tags$hr(),
+        tags$div(class = "control-heading", "Score thresholds"),
+        uiOutput("prom_pass_ui"),
+        conditionalPanel(
+          condition = "input.prom_view == 'change'",
+          uiOutput("prom_change_mcid_ui")
+        ),
+        conditionalPanel(
+          condition = "input.prom_view == 'change'",
+          tags$hr(),
+          tags$div(class = "control-heading", "Pre-op vs post-op change"),
+          uiOutput("prom_change_stage_ui"),
+          tags$p(
+            class = "help-note",
+            "Change = follow-up score minus pre-op score for the same case and side, so a positive change is an improvement. The Stage filter above does not apply here — the paired analysis always needs both stages."
+          )
+        ),
         tags$p(
           class = "help-note",
           "Date filtering uses procedure date when the PROM record links back to the case table; otherwise it falls back to the PROM event date."
@@ -1124,19 +1436,56 @@ ui <- navbarPage(
       ),
       mainPanel(
         uiOutput("prom_link_note"),
-        uiOutput("prom_metrics"),
-        fluidRow(
-          column(6, plotOutput("prom_stage_plot", height = 300)),
-          column(6, plotOutput("prom_compare_plot", height = 300))
-        ),
-        h4("Stage summary"),
-        DTOutput("prom_stage_summary_table"),
-        h4("Comparison summary"),
-        DTOutput("prom_compare_summary_table"),
-        h4("Filtered PROM records"),
-        DTOutput("prom_raw_table"),
-        h4("Trajectory for selected case"),
-        DTOutput("prom_trajectory_table")
+        tabsetPanel(
+          id = "prom_view",
+          tabPanel(
+            "Scores by stage",
+            value = "levels",
+            uiOutput("prom_metrics"),
+            fluidRow(
+              column(6, plotOutput("prom_stage_plot", height = 300)),
+              column(6, plotOutput("prom_compare_plot", height = 300))
+            ),
+            h4("Patient acceptable symptom state"),
+            uiOutput("prom_pass_note"),
+            fluidRow(
+              column(6, plotOutput("prom_pass_stage_plot", height = 320)),
+              column(6, plotOutput("prom_pass_group_plot", height = 320))
+            ),
+            DTOutput("prom_pass_stage_table"),
+            h4("Stage summary"),
+            DTOutput("prom_stage_summary_table"),
+            h4("Comparison summary"),
+            DTOutput("prom_compare_summary_table"),
+            h4("Filtered PROM records"),
+            DTOutput("prom_raw_table"),
+            h4("Trajectory for selected case"),
+            DTOutput("prom_trajectory_table")
+          ),
+          tabPanel(
+            "Pre-op vs post-op change",
+            value = "change",
+            uiOutput("prom_change_note"),
+            uiOutput("prom_change_metrics"),
+            fluidRow(
+              column(6, plotOutput("prom_change_hist", height = 320)),
+              column(6, plotOutput("prom_change_scatter", height = 320))
+            ),
+            h4("Mean change by follow-up stage"),
+            plotOutput("prom_change_stage_plot", height = 320),
+            DTOutput("prom_change_stage_table"),
+            h4("Improvement vs acceptable symptom state"),
+            uiOutput("prom_responder_note"),
+            DTOutput("prom_responder_table"),
+            h4("Change summary by comparison group"),
+            plotOutput("prom_change_group_plot", height = 340),
+            DTOutput("prom_change_group_table"),
+            h4("Paired cases"),
+            downloadButton("download_prom_change", "Download paired change data"),
+            tags$br(), tags$br(),
+            DTOutput("prom_change_case_table")
+          )
+        )
       )
     )
   ),
@@ -1625,16 +1974,13 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "prom_case_id", choices = choices, selected = head(choices, 1), server = TRUE)
   })
 
-  filtered_prom <- reactive({
+  # Every PROM filter except Stage. The paired change analysis needs the pre-op
+  # and follow-up rows for a case to survive together, so it starts from here.
+  filtered_prom_all_stages <- reactive({
     req(input$prom_type)
     df <- prepare_prom_data(input$prom_type)
 
     df <- apply_date_filter(df, "analysis_date", input$prom_date_range)
-
-    stages <- input$prom_stage
-    if (!is.null(stages) && length(stages) > 0) {
-      df <- df %>% filter(as.character(Stage) %in% stages)
-    }
 
     if (!identical(input$prom_type, "eq5d")) {
       lats <- input$prom_laterality %||% character(0)
@@ -1651,6 +1997,17 @@ server <- function(input, output, session) {
     df <- apply_component_filter(df, "acetabular_component", input$prom_acetabular_component)
 
     df %>% arrange(Stage, analysis_date, event_date_parsed)
+  })
+
+  filtered_prom <- reactive({
+    df <- filtered_prom_all_stages()
+
+    stages <- input$prom_stage
+    if (!is.null(stages) && length(stages) > 0) {
+      df <- df %>% filter(as.character(Stage) %in% stages)
+    }
+
+    df
   })
 
   output$prom_link_note <- renderUI({
@@ -1681,17 +2038,31 @@ server <- function(input, output, session) {
   })
 
   output$prom_metrics <- renderUI({
+    req(input$prom_type)
     df <- filtered_prom()
+    threshold <- prom_pass_threshold()
+    digits <- prom_score_digits(input$prom_type)
+
+    postop_df <- prom_postop_records(df)
+    pass_value <- pass_rate(postop_df$Score, threshold)
+    pass_display <- if (is.na(pass_value)) "NA" else paste0(pass_value, "%")
+    pass_subtitle <- if (is.na(threshold)) {
+      "Set a PASS threshold in the sidebar"
+    } else {
+      sprintf("%s+ at follow-up (%s records, pre-op excluded)", threshold, format(nrow(postop_df), big.mark = ","))
+    }
+
     fluidRow(
       column(3, metric_box("Filtered records", nrow(df), "PROM rows after filters")),
-      column(3, metric_box("Mean score", ifelse(nrow(df) == 0 || all(is.na(df$Score)), "NA", round(mean(df$Score, na.rm = TRUE), 1)), "Average score")),
+      column(3, metric_box("Mean score", ifelse(nrow(df) == 0 || all(is.na(df$Score)), "NA", round(mean(df$Score, na.rm = TRUE), digits)), "Average score")),
       column(3, metric_box("Median score", ifelse(nrow(df) == 0 || all(is.na(df$Score)), "NA", median(df$Score, na.rm = TRUE)), "Middle score")),
-      column(3, metric_box("Unique cases", count_unique_ids(df), "Distinct FORM_RESPONSE_GROUP_ID"))
+      column(3, metric_box("Unique cases", count_unique_ids(df), "Distinct FORM_RESPONSE_GROUP_ID")),
+      column(3, metric_box("PASS rate", pass_display, pass_subtitle))
     )
   })
 
   output$prom_stage_plot <- renderPlot({
-    df <- summarise_scores(filtered_prom(), group_cols = c("Stage"))
+    df <- summarise_scores(filtered_prom(), group_cols = c("Stage"), digits = prom_score_digits(input$prom_type))
     validate(need(nrow(df) > 0, "No PROM scores available for the current filters."))
 
     ggplot(df, aes(x = Stage, y = mean, group = 1)) +
@@ -1707,8 +2078,11 @@ server <- function(input, output, session) {
     df <- df %>% filter(!is.na(Score))
 
     compare_col <- input$prom_compare %||% "overall"
+    digits <- prom_score_digits(input$prom_type)
+    threshold <- prom_pass_threshold()
+
     if (identical(compare_col, "overall")) {
-      return(summarise_scores(df))
+      return(summarise_scores(df, pass_threshold = threshold, digits = digits))
     }
 
     grouped_df <- expand_group_column(df, compare_col)
@@ -1719,7 +2093,7 @@ server <- function(input, output, session) {
       group_cols <- c(group_cols, "Stage")
     }
 
-    summary_df <- summarise_scores(grouped_df, group_cols = group_cols)
+    summary_df <- summarise_scores(grouped_df, group_cols = group_cols, pass_threshold = threshold, digits = digits)
     rename_group_column(summary_df, friendly_group_label(compare_col))
   })
 
@@ -1779,7 +2153,14 @@ server <- function(input, output, session) {
   })
 
   output$prom_stage_summary_table <- renderDT({
-    datatable_or_message(summarise_scores(filtered_prom(), group_cols = c("Stage")))
+    datatable_or_message(
+      summarise_scores(
+        filtered_prom(),
+        group_cols = c("Stage"),
+        pass_threshold = prom_pass_threshold(),
+        digits = prom_score_digits(input$prom_type)
+      )
+    )
   })
 
   output$prom_compare_summary_table <- renderDT({
@@ -1840,6 +2221,559 @@ server <- function(input, output, session) {
     filename = function() paste0("inor_proms_", input$prom_type, "_", Sys.Date(), ".csv"),
     content = function(file) write_export(filtered_prom(), file)
   )
+
+  # ---------------------------------------------------------------------------
+  # Patient acceptable symptom state (PASS)
+  # ---------------------------------------------------------------------------
+
+  output$prom_pass_ui <- renderUI({
+    req(input$prom_type)
+    tagList(
+      numericInput(
+        "prom_pass_threshold",
+        "PASS threshold (score at or above)",
+        value = prom_default_pass(input$prom_type),
+        min = 0,
+        step = if (identical(input$prom_type, "eq5d")) 0.01 else 1
+      ),
+      tags$p(class = "help-note", prom_pass_reference_note(input$prom_type))
+    )
+  })
+
+  prom_pass_threshold <- reactive({
+    req(input$prom_type)
+    value <- suppressWarnings(as.numeric(input$prom_pass_threshold))
+    if (length(value) != 1 || is.na(value)) prom_default_pass(input$prom_type) else value
+  })
+
+  output$prom_pass_note <- renderUI({
+    req(input$prom_type)
+    threshold <- prom_pass_threshold()
+    if (length(threshold) != 1 || is.na(threshold)) {
+      return(tags$div(class = "notice-box", "Set a PASS threshold in the sidebar to see acceptable-state rates."))
+    }
+
+    tags$p(
+      class = "help-note",
+      sprintf(
+        "PASS rate = the share of records scoring %s or above on the %s. Unlike the MCID this is an absolute score, so it needs no pre-op baseline. The headline rate and the group comparison use follow-up records only — a group's mix of stages would otherwise masquerade as a difference in outcome. Pre-op appears in the by-stage breakdown below as a reference point.",
+        threshold, prom_score_label(input$prom_type)
+      )
+    )
+  })
+
+  prom_pass_stage_summary <- reactive({
+    req(input$prom_type)
+    df <- filtered_prom()
+    threshold <- prom_pass_threshold()
+    if (nrow(df) == 0 || is.na(threshold)) return(data.frame())
+
+    df %>%
+      filter(!is.na(Score), !is.na(Stage)) %>%
+      group_by(Stage) %>%
+      summarise(
+        Records = dplyr::n(),
+        `Meeting PASS` = sum(Score >= threshold, na.rm = TRUE),
+        `PASS (%)` = pass_rate(Score, threshold),
+        .groups = "drop"
+      ) %>%
+      arrange(Stage)
+  })
+
+  output$prom_pass_stage_plot <- renderPlot({
+    req(input$prom_type)
+    summary_df <- prom_pass_stage_summary()
+    validate(need(nrow(summary_df) > 0, "No scored PROM records for the current filters."))
+
+    ggplot(summary_df, aes(x = Stage, y = `PASS (%)`)) +
+      geom_col(fill = "#1d4ed8") +
+      geom_text(aes(label = paste0(`PASS (%)`, "%\nn=", Records)), vjust = -0.3, size = 3.2, colour = "#64748b") +
+      scale_y_continuous(limits = c(0, 100), expand = ggplot2::expansion(mult = c(0, 0.18))) +
+      labs(
+        title = paste0("PASS rate by stage (threshold ", prom_pass_threshold(), ")"),
+        x = NULL, y = "% of records at or above threshold"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 30, hjust = 1))
+  })
+
+  prom_pass_group_summary <- reactive({
+    req(input$prom_type)
+    threshold <- prom_pass_threshold()
+    compare_col <- input$prom_compare %||% "overall"
+    df <- prom_postop_records(filtered_prom()) %>% filter(!is.na(Score))
+    if (nrow(df) == 0 || is.na(threshold)) return(data.frame())
+
+    if (identical(compare_col, "overall")) {
+      return(
+        data.frame(
+          Overall = "All filtered records",
+          Records = nrow(df),
+          `PASS (%)` = pass_rate(df$Score, threshold),
+          check.names = FALSE,
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+
+    grouped_df <- expand_group_column(df, compare_col)
+    if (nrow(grouped_df) == 0) return(data.frame())
+
+    summary_df <- grouped_df %>%
+      group_by(.group_value) %>%
+      summarise(
+        Records = dplyr::n(),
+        `PASS (%)` = pass_rate(Score, threshold),
+        .groups = "drop"
+      )
+
+    rename_group_column(summary_df, friendly_group_label(compare_col))
+  })
+
+  output$prom_pass_group_plot <- renderPlot({
+    req(input$prom_type)
+    compare_col <- input$prom_compare %||% "overall"
+    threshold <- prom_pass_threshold()
+
+    # A single bar says nothing, so with no grouping selected show where the
+    # cohort actually sits relative to the threshold instead.
+    if (identical(compare_col, "overall")) {
+      df <- prom_postop_records(filtered_prom()) %>% filter(!is.na(Score))
+      validate(need(nrow(df) > 0, "No scored follow-up records for the current filters."))
+      validate(need(!is.na(threshold), "Set a PASS threshold in the sidebar."))
+
+      rate <- pass_rate(df$Score, threshold)
+      return(
+        ggplot(df, aes(x = Score, fill = Score >= threshold)) +
+          geom_histogram(bins = 24, colour = "white") +
+          geom_vline(xintercept = threshold, linetype = "dashed", colour = "#0f172a", linewidth = 0.8) +
+          scale_fill_manual(
+            values = c(`TRUE` = "#0ea5e9", `FALSE` = "#cbd5e1"),
+            labels = c(`TRUE` = "At or above PASS", `FALSE` = "Below PASS"),
+            breaks = c("TRUE", "FALSE")
+          ) +
+          labs(
+            title = "Score distribution against the PASS threshold",
+            subtitle = sprintf("Follow-up records only: %s%% of %s are at or above %s", rate, format(nrow(df), big.mark = ","), threshold),
+            x = prom_score_label(input$prom_type), y = "Records", fill = NULL
+          ) +
+          theme_minimal(base_size = 12) +
+          theme(legend.position = "top")
+      )
+    }
+
+    summary_df <- prom_pass_group_summary()
+    validate(need(nrow(summary_df) > 0, "No linked PROM rows are available for the selected comparison."))
+
+    label <- friendly_group_label(compare_col)
+    plot_df <- summary_df %>%
+      arrange(desc(Records)) %>%
+      slice_head(n = 12) %>%
+      mutate(group_label = factor(.data[[label]], levels = .data[[label]][order(`PASS (%)`)]))
+
+    ggplot(plot_df, aes(x = `PASS (%)`, y = group_label)) +
+      geom_col(fill = "#0ea5e9") +
+      geom_text(aes(label = paste0(`PASS (%)`, "% (n=", Records, ")")), hjust = -0.05, size = 3.2, colour = "#64748b") +
+      scale_x_continuous(
+        limits = c(0, 118),
+        breaks = seq(0, 100, 25),
+        expand = ggplot2::expansion(mult = c(0, 0))
+      ) +
+      labs(
+        title = paste("PASS rate by", tolower(label)),
+        subtitle = "Follow-up records only, stages pooled; up to 12 groups with the most records",
+        x = "% of records at or above threshold", y = NULL
+      ) +
+      theme_minimal(base_size = 12)
+  })
+
+  output$prom_pass_stage_table <- renderDT({
+    datatable_or_message(
+      prom_pass_stage_summary(),
+      "No scored PROM records for the current filters."
+    )
+  })
+
+  output$prom_responder_note <- renderUI({
+    req(input$prom_type)
+    threshold <- prom_pass_threshold()
+    if (length(threshold) != 1 || is.na(threshold)) {
+      return(tags$div(class = "notice-box", "Set a PASS threshold in the sidebar to split the paired cohort by responder status."))
+    }
+
+    tags$p(
+      class = "help-note",
+      sprintf(
+        "MCID asks whether a patient gained enough (change of %s or more); PASS asks whether their state is acceptable now (%s or above at follow-up). A patient starting from a very low baseline can clear the MCID and still fall short of PASS.",
+        prom_change_mcid(), threshold
+      )
+    )
+  })
+
+  output$prom_responder_table <- renderDT({
+    req(input$prom_type)
+    datatable_or_message(
+      responder_matrix(prom_change_data(), prom_change_mcid(), prom_pass_threshold()),
+      "No paired cases to classify, or no PASS threshold set."
+    )
+  })
+
+  # ---------------------------------------------------------------------------
+  # Pre-op vs post-op change
+  # ---------------------------------------------------------------------------
+
+  prom_available_followups <- reactive({
+    req(input$prom_type)
+    present <- unique(as.character(prepare_prom_data(input$prom_type)$Stage))
+    intersect(prom_followup_stages, present)
+  })
+
+  output$prom_change_stage_ui <- renderUI({
+    choices <- prom_available_followups()
+    if (!length(choices)) {
+      return(tags$p(class = "help-note", "This PROM extract has no timed follow-up stages, so no change can be calculated."))
+    }
+    selectInput("prom_change_stage", "Follow-up stage", choices = choices, selected = choices[[1]])
+  })
+
+  output$prom_change_mcid_ui <- renderUI({
+    req(input$prom_type)
+    default_mcid <- prom_default_mcid(input$prom_type)
+    numericInput(
+      "prom_change_mcid",
+      "Minimal clinically important difference",
+      value = default_mcid,
+      min = 0,
+      step = if (identical(input$prom_type, "eq5d")) 0.001 else 1
+    )
+  })
+
+  prom_change_mcid <- reactive({
+    req(input$prom_type)
+    value <- suppressWarnings(as.numeric(input$prom_change_mcid))
+    if (length(value) != 1 || is.na(value)) prom_default_mcid(input$prom_type) else value
+  })
+
+  prom_change_all_stages <- reactive({
+    build_prom_change_data(filtered_prom_all_stages(), prom_followup_stages)
+  })
+
+  prom_change_data <- reactive({
+    df <- prom_change_all_stages()
+    stage <- input$prom_change_stage
+    if (nrow(df) == 0 || is.null(stage) || !nzchar(stage)) return(df[0, , drop = FALSE])
+    df %>% filter(as.character(followup_stage) == stage)
+  })
+
+  output$prom_change_note <- renderUI({
+    req(input$prom_type)
+    stage <- input$prom_change_stage
+    if (is.null(stage) || !nzchar(stage)) {
+      return(tags$div(class = "notice-box", "Select a follow-up stage to compare against the pre-op baseline."))
+    }
+
+    counts <- prom_pairing_counts(filtered_prom_all_stages(), stage)
+
+    if (counts$paired == 0) {
+      return(
+        tags$div(
+          class = "notice-box",
+          sprintf(
+            "No case has both a pre-op score and a %s score under the current filters (%s pre-op only, %s follow-up only). Widen the date range or clear a filter.",
+            tolower(stage), format(counts$preop_only, big.mark = ","), format(counts$followup_only, big.mark = ",")
+          )
+        )
+      )
+    }
+
+    tags$div(
+      class = "success-box",
+      sprintf(
+        "%s case-sides paired pre-op to %s. Unpaired and excluded: %s with a pre-op score but no %s score, %s with a %s score but no pre-op baseline.",
+        format(counts$paired, big.mark = ","),
+        tolower(stage),
+        format(counts$preop_only, big.mark = ","),
+        tolower(stage),
+        format(counts$followup_only, big.mark = ","),
+        tolower(stage)
+      )
+    )
+  })
+
+  output$prom_change_metrics <- renderUI({
+    req(input$prom_type)
+    df <- prom_change_data()
+    digits <- prom_score_digits(input$prom_type)
+    mcid <- prom_change_mcid()
+
+    if (nrow(df) == 0) {
+      return(
+        fluidRow(
+          column(3, metric_box("Paired cases", 0, "Pre-op and follow-up both present")),
+          column(3, metric_box("Mean pre-op", "NA", prom_score_label(input$prom_type))),
+          column(3, metric_box("Mean follow-up", "NA", "Selected follow-up stage")),
+          column(3, metric_box("Mean change", "NA", "Follow-up minus pre-op"))
+        )
+      )
+    }
+
+    p_text <- format_p_value(paired_p_value(df$change))
+    p_label <- if (identical(p_text, "NA")) {
+      "Paired t-test not estimable"
+    } else if (startsWith(p_text, "<")) {
+      paste0("p ", p_text, " (paired t-test)")
+    } else {
+      paste0("p = ", p_text, " (paired t-test)")
+    }
+
+    ci <- mean_ci_bounds(df$change)
+    ci_text <- if (any(is.na(ci))) {
+      "95% CI not estimable"
+    } else {
+      sprintf("95%% CI %s to %s", round(ci[[1]], digits), round(ci[[2]], digits))
+    }
+    met_mcid <- round(100 * mean(df$change >= mcid, na.rm = TRUE), 1)
+
+    threshold <- prom_pass_threshold()
+    pass_value <- pass_rate(df$followup_score, threshold)
+    pass_display <- if (is.na(pass_value)) "NA" else paste0(pass_value, "%")
+    pass_subtitle <- if (is.na(threshold)) {
+      "Set a PASS threshold in the sidebar"
+    } else {
+      sprintf("Follow-up score of %s or above", threshold)
+    }
+
+    fluidRow(
+      column(3, metric_box("Paired cases", format(nrow(df), big.mark = ","), p_label)),
+      column(3, metric_box("Mean pre-op", round(mean(df$preop_score, na.rm = TRUE), digits), prom_score_label(input$prom_type))),
+      column(3, metric_box("Mean follow-up", round(mean(df$followup_score, na.rm = TRUE), digits), input$prom_change_stage)),
+      column(3, metric_box("Mean change", format_change_value(mean(df$change, na.rm = TRUE), digits), ci_text)),
+      column(3, metric_box("Improved", paste0(round(100 * mean(df$change > 0, na.rm = TRUE), 1), "%"), "Any gain over pre-op")),
+      column(3, metric_box("Met MCID", paste0(met_mcid, "%"), sprintf("Change of %s or more", mcid))),
+      column(3, metric_box("Unchanged", paste0(round(100 * mean(df$change == 0, na.rm = TRUE), 1), "%"), "Same score as pre-op")),
+      column(3, metric_box("Worse", paste0(round(100 * mean(df$change < 0, na.rm = TRUE), 1), "%"), "Below pre-op score")),
+      column(3, metric_box("Met PASS", pass_display, pass_subtitle))
+    )
+  })
+
+  output$prom_change_hist <- renderPlot({
+    req(input$prom_type)
+    df <- prom_change_data()
+    validate(need(nrow(df) > 0, "No paired pre-op and follow-up scores for the current filters."))
+
+    mcid <- prom_change_mcid()
+    mean_change <- mean(df$change, na.rm = TRUE)
+
+    ggplot(df, aes(x = change)) +
+      geom_histogram(bins = 20, fill = "#3b82f6", colour = "white") +
+      geom_vline(xintercept = 0, linetype = "dashed", colour = "#475569") +
+      geom_vline(xintercept = mcid, linetype = "dotted", colour = "#10b981", linewidth = 0.8) +
+      geom_vline(xintercept = mean_change, colour = "#b91c1c", linewidth = 0.8) +
+      labs(
+        title = paste("Change from pre-op to", tolower(input$prom_change_stage %||% "follow-up")),
+        subtitle = "Dashed = no change, dotted green = MCID, solid red = mean change",
+        x = "Change in score", y = "Case-sides"
+      ) +
+      theme_minimal(base_size = 12)
+  })
+
+  output$prom_change_scatter <- renderPlot({
+    req(input$prom_type)
+    df <- prom_change_data()
+    validate(need(nrow(df) > 0, "No paired pre-op and follow-up scores for the current filters."))
+
+    ggplot(df, aes(x = preop_score, y = followup_score)) +
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "#475569") +
+      geom_point(alpha = 0.35, colour = "#1d4ed8") +
+      labs(
+        title = "Pre-op score vs follow-up score",
+        subtitle = "Points above the line improved; points below deteriorated",
+        x = paste("Pre-op", prom_score_label(input$prom_type)),
+        y = paste("Follow-up", prom_score_label(input$prom_type))
+      ) +
+      theme_minimal(base_size = 12)
+  })
+
+  prom_change_stage_summary <- reactive({
+    req(input$prom_type)
+    summarise_prom_change(
+      prom_change_all_stages(),
+      group_cols = "followup_stage",
+      mcid = prom_change_mcid(),
+      digits = prom_score_digits(input$prom_type),
+      pass_threshold = prom_pass_threshold()
+    )
+  })
+
+  output$prom_change_stage_plot <- renderPlot({
+    req(input$prom_type)
+    summary_df <- prom_change_stage_summary()
+    validate(need(nrow(summary_df) > 0, "No paired pre-op and follow-up scores for the current filters."))
+
+    ggplot(summary_df, aes(x = followup_stage, y = `Mean change`, group = 1)) +
+      geom_hline(yintercept = 0, linetype = "dashed", colour = "#475569") +
+      geom_hline(yintercept = prom_change_mcid(), linetype = "dotted", colour = "#10b981") +
+      geom_line(colour = "#1d4ed8", linewidth = 0.8) +
+      geom_errorbar(aes(ymin = `CI low`, ymax = `CI high`), width = 0.12, colour = "#1d4ed8") +
+      geom_point(size = 3, colour = "#1d4ed8") +
+      geom_text(aes(label = paste0("n=", `Paired cases`)), vjust = -1.4, size = 3.4, colour = "#64748b") +
+      scale_y_continuous(expand = ggplot2::expansion(mult = c(0.08, 0.18))) +
+      labs(
+        title = "Mean change from pre-op, by follow-up stage",
+        subtitle = "Bars show the 95% confidence interval; dotted line is the MCID",
+        x = NULL, y = "Mean change in score"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(axis.text.x = element_text(angle = 20, hjust = 1))
+  })
+
+  output$prom_change_stage_table <- renderDT({
+    summary_df <- prom_change_stage_summary()
+    if (nrow(summary_df) > 0) {
+      names(summary_df)[names(summary_df) == "followup_stage"] <- "Follow-up stage"
+    }
+    datatable_or_message(
+      summary_df,
+      "No case has both a pre-op score and a follow-up score under the current filters."
+    )
+  })
+
+  prom_change_group_summary <- reactive({
+    req(input$prom_type)
+    df <- prom_change_data()
+    compare_col <- input$prom_compare %||% "overall"
+    mcid <- prom_change_mcid()
+    digits <- prom_score_digits(input$prom_type)
+
+    threshold <- prom_pass_threshold()
+
+    if (identical(compare_col, "overall")) {
+      overall_df <- summarise_prom_change(df, mcid = mcid, digits = digits, pass_threshold = threshold)
+      if (nrow(overall_df) > 0) {
+        overall_df <- dplyr::bind_cols(
+          data.frame(Overall = "All filtered cases", check.names = FALSE),
+          overall_df
+        )
+      }
+      return(overall_df)
+    }
+
+    grouped_df <- expand_group_column(df, compare_col)
+    if (nrow(grouped_df) == 0) return(data.frame())
+
+    summary_df <- summarise_prom_change(
+      grouped_df,
+      group_cols = ".group_value",
+      mcid = mcid,
+      digits = digits,
+      pass_threshold = threshold
+    )
+    rename_group_column(summary_df, friendly_group_label(compare_col))
+  })
+
+  output$prom_change_group_plot <- renderPlot({
+    req(input$prom_type)
+    compare_col <- input$prom_compare %||% "overall"
+    summary_df <- prom_change_group_summary()
+
+    validate(need(
+      nrow(summary_df) > 0,
+      if (identical(compare_col, "overall")) {
+        "No paired pre-op and follow-up scores for the current filters."
+      } else {
+        "No linked paired rows are available for the selected comparison."
+      }
+    ))
+
+    label <- friendly_group_label(compare_col)
+    if (identical(compare_col, "overall")) {
+      summary_df[[label]] <- "All filtered cases"
+    }
+
+    plot_df <- summary_df %>%
+      arrange(desc(`Paired cases`)) %>%
+      slice_head(n = 12) %>%
+      mutate(group_label = factor(.data[[label]], levels = .data[[label]][order(`Mean change`)]))
+
+    ggplot(plot_df, aes(y = group_label)) +
+      geom_segment(aes(x = `Mean pre-op`, xend = `Mean follow-up`, yend = group_label), colour = "#94a3b8", linewidth = 1.1) +
+      geom_point(aes(x = `Mean pre-op`, colour = "Pre-op"), size = 3) +
+      geom_point(aes(x = `Mean follow-up`, colour = "Follow-up"), size = 3) +
+      scale_colour_manual(values = c("Pre-op" = "#f59e0b", "Follow-up" = "#1d4ed8"), breaks = c("Pre-op", "Follow-up")) +
+      labs(
+        title = paste("Mean pre-op and follow-up score by", tolower(label)),
+        subtitle = "Up to 12 groups with the most paired cases",
+        x = "Mean score", y = NULL, colour = NULL
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(legend.position = "top")
+  })
+
+  output$prom_change_group_table <- renderDT({
+    compare_col <- input$prom_compare %||% "overall"
+    message <- if (identical(compare_col, "overall")) {
+      "No paired pre-op and follow-up scores for the current filters."
+    } else {
+      "No linked paired rows are available for the selected comparison."
+    }
+    datatable_or_message(prom_change_group_summary(), message)
+  })
+
+  prom_change_display <- reactive({
+    req(input$prom_type)
+    df <- prom_change_data()
+    if (nrow(df) == 0) return(data.frame())
+
+    mcid <- prom_change_mcid()
+    threshold <- prom_pass_threshold()
+    met_pass <- if (length(threshold) == 1 && !is.na(threshold)) {
+      ifelse(is.na(df$followup_score), NA, ifelse(df$followup_score >= threshold, "Yes", "No"))
+    } else {
+      NA_character_
+    }
+
+    data.frame(
+      FORM_RESPONSE_GROUP_ID = df$FORM_RESPONSE_GROUP_ID,
+      `Patient Id` = df$`Patient Id`,
+      `MRN Number` = df$`MRN Number`,
+      `First Name` = df$`First Name`,
+      `Last Name` = df$`Last Name`,
+      Side = df$pair_side,
+      `Follow-up stage` = as.character(df$followup_stage),
+      `Pre-op score` = df$preop_score,
+      `Follow-up score` = df$followup_score,
+      Change = df$change,
+      `Met MCID` = ifelse(is.na(df$change), NA, ifelse(df$change >= mcid, "Yes", "No")),
+      `Met PASS` = met_pass,
+      `Pre-op date` = as.character(df$preop_date),
+      `Follow-up date` = as.character(df$followup_date),
+      `Days between` = df$days_from_preop,
+      Consultant = df$consultant,
+      `Surgeon grade` = df$surgeon_grade,
+      `Implant fixation type` = df$fixation_type,
+      `Knee system` = df$knee_system,
+      `Femoral component` = df$femoral_component,
+      `Acetabular component` = df$acetabular_component,
+      Hospital = df$HOSPITAL_NAME,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+  })
+
+  output$prom_change_case_table <- renderDT({
+    datatable_or_message(
+      prom_change_display(),
+      "No case has both a pre-op score and a follow-up score under the current filters."
+    )
+  })
+
+  output$download_prom_change <- downloadHandler(
+    filename = function() {
+      paste0("inor_proms_change_", input$prom_type, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) write_export(prom_change_display(), file)
+  )
+
 
   output$peri_comp_date_ui <- renderUI({
     bounds <- date_bounds(prepare_periop_complication_data(input$peri_comp_source %||% "all")$analysis_date)

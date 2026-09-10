@@ -560,7 +560,8 @@ get_proms_trajectory <- function(case_id, prom_type = c("knee", "hip", "eq5d")) 
 
   stage_order <- c(
     "Pre-op presentation", "6 month presentation", "1 year presentation",
-    "2 year presentation", "5 year presentation", "10 year presentation"
+    "2 year presentation", "5 year presentation", "10 year presentation",
+    "Extraordinary presentation"
   )
 
   df <- switch(prom_type,
@@ -572,8 +573,22 @@ get_proms_trajectory <- function(case_id, prom_type = c("knee", "hip", "eq5d")) 
   df %>%
     mutate(Stage = factor(Stage, levels = stage_order, ordered = TRUE)) %>%
     arrange(Stage) %>%
+    # Baseline is the last pre-op score recorded for the case, so the change
+    # column reads as "gain since the score taken closest to surgery". Knee and
+    # hip scores are baselined per side; EQ-5D has no laterality column.
+    group_by(across(any_of("Laterality"))) %>%
+    mutate(
+      `Pre-op score` = dplyr::last(c(NA_real_, Score[which(as.character(Stage) == "Pre-op presentation")])),
+      `Change from pre-op` = dplyr::if_else(
+        as.character(Stage) == "Pre-op presentation",
+        NA_real_,
+        Score - `Pre-op score`
+      )
+    ) %>%
+    ungroup() %>%
+    arrange(across(any_of("Laterality")), Stage) %>%
     select(FORM_RESPONSE_GROUP_ID, `MRN Number`, `First Name`, `Last Name`,
-           any_of("Laterality"), Stage, Score, `Event date`)
+           any_of("Laterality"), Stage, Score, `Change from pre-op`, `Event date`)
 }
 
 
