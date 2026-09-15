@@ -6,3 +6,4 @@ RawData/
 *.csv
 *.xlsx
 *.html
+.DS_Store
