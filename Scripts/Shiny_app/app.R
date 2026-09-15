@@ -530,8 +530,25 @@ expand_group_column <- function(df, group_col) {
       mutate(.group_value = trimws(.group_value))
   }
 
-  result %>%
+  result <- result %>%
     filter(!is.na(.group_value) & .group_value != "")
+
+  # Age and BMI bands are ordered factors; keep that order so every summary and
+  # chart reads low-to-high rather than alphabetically ("Under 50" last, or
+  # "Obese III" before "Overweight").
+  if (is.factor(df[[group_col]]) && nrow(result) > 0) {
+    present <- levels(df[[group_col]])
+    present <- present[present %in% unique(result$.group_value)]
+    if (length(present)) {
+      result$.group_value <- factor(
+        result$.group_value,
+        levels = present,
+        ordered = is.ordered(df[[group_col]])
+      )
+    }
+  }
+
+  result
 }
 
 friendly_group_label <- function(group_col) {
@@ -544,6 +561,11 @@ friendly_group_label <- function(group_col) {
     knee_system = "Knee system",
     femoral_component = "Femoral component",
     acetabular_component = "Acetabular component",
+    patient_sex = "Sex",
+    age_band = "Age band",
+    bmi_band = "BMI band",
+    patient_age = "Age",
+    bmi = "BMI",
     Stage = "Stage",
     Joint = "Joint",
     ACCESS_POINT_NAME = "Hospital",
@@ -644,6 +666,93 @@ prom_pass_reference_note <- function(prom_type) {
 prom_postop_records <- function(df) {
   if (is.null(df) || nrow(df) == 0 || !"Stage" %in% names(df)) return(df)
   df %>% filter(as.character(Stage) %in% prom_followup_stages)
+}
+
+# -----------------------------------------------------------------------------
+# Patient demographics
+# -----------------------------------------------------------------------------
+
+age_band_levels <- c("Under 50", "50-59", "60-69", "70-79", "80 and over")
+
+band_age <- function(age) {
+  age <- suppressWarnings(as.numeric(age))
+  factor(
+    dplyr::case_when(
+      is.na(age) ~ NA_character_,
+      age < 50 ~ "Under 50",
+      age < 60 ~ "50-59",
+      age < 70 ~ "60-69",
+      age < 80 ~ "70-79",
+      TRUE ~ "80 and over"
+    ),
+    levels = age_band_levels,
+    ordered = TRUE
+  )
+}
+
+# WHO categories. Obesity classes are kept separate because operative risk and
+# PROM gain differ across them, and pooling everything over 30 hides that.
+bmi_band_levels <- c(
+  "Underweight (<18.5)", "Healthy (18.5-24.9)", "Overweight (25-29.9)",
+  "Obese I (30-34.9)", "Obese II (35-39.9)", "Obese III (40+)"
+)
+
+band_bmi <- function(bmi) {
+  bmi <- suppressWarnings(as.numeric(bmi))
+  factor(
+    dplyr::case_when(
+      is.na(bmi) ~ NA_character_,
+      bmi < 18.5 ~ "Underweight (<18.5)",
+      bmi < 25 ~ "Healthy (18.5-24.9)",
+      bmi < 30 ~ "Overweight (25-29.9)",
+      bmi < 35 ~ "Obese I (30-34.9)",
+      bmi < 40 ~ "Obese II (35-39.9)",
+      TRUE ~ "Obese III (40+)"
+    ),
+    levels = bmi_band_levels,
+    ordered = TRUE
+  )
+}
+
+tidy_sex_value <- function(x) {
+  x <- trimws(as.character(x))
+  x[is.na(x) | !nzchar(x)] <- NA_character_
+  x
+}
+
+# Range filter that keeps or drops unrecorded values explicitly, rather than
+# letting a slider silently delete every case with no value on file.
+apply_range_filter <- function(df, column, range_value, include_missing = TRUE) {
+  if (!column %in% names(df)) return(df)
+  values <- suppressWarnings(as.numeric(df[[column]]))
+
+  if (is.null(range_value) || length(range_value) < 2 || any(is.na(range_value))) {
+    if (isTRUE(include_missing)) return(df)
+    return(df[!is.na(values), , drop = FALSE])
+  }
+
+  in_range <- !is.na(values) & values >= range_value[[1]] & values <= range_value[[2]]
+  keep <- if (isTRUE(include_missing)) in_range | is.na(values) else in_range
+  df[keep, , drop = FALSE]
+}
+
+numeric_bounds <- function(x, pad = TRUE) {
+  x <- suppressWarnings(as.numeric(x))
+  x <- x[is.finite(x)]
+  if (!length(x)) return(NULL)
+  lo <- floor(min(x))
+  hi <- ceiling(max(x))
+  if (lo == hi) hi <- lo + 1
+  list(min = lo, max = hi)
+}
+
+# One colour per follow-up stage, dark to light with time since surgery, so the
+# same stage reads the same way on every chart.
+prom_stage_palette <- function() {
+  stats::setNames(
+    c("#1e3a8a", "#1d4ed8", "#3b82f6", "#60a5fa", "#93c5fd"),
+    prom_followup_stages
+  )
 }
 
 # Share of records at or above the PASS threshold. Returns NA rather than 0 when
@@ -871,6 +980,339 @@ responder_matrix <- function(df, mcid, pass_threshold) {
     mutate(Outcome = as.character(Outcome))
 }
 
+# -----------------------------------------------------------------------------
+# Rolling-window trend helpers
+# -----------------------------------------------------------------------------
+# Cases are ordered by procedure date and each point summarises the preceding
+# window of cases, so the x axis is operative sequence rather than calendar time.
+# A right-aligned window means a point is only ever informed by cases at or
+# before it — no value is influenced by surgery that had not happened yet.
+
+# Right-aligned rolling statistic. Returns NA until a full window is available,
+# so a trend never opens with a point computed from two or three cases.
+rolling_stat <- function(x, window, fun) {
+  n <- length(x)
+  if (n == 0) return(numeric(0))
+  window <- max(1L, as.integer(window))
+  if (window > n) return(rep(NA_real_, n))
+
+  vapply(
+    seq_len(n),
+    function(i) {
+      if (i < window) return(NA_real_)
+      value <- suppressWarnings(fun(x[(i - window + 1):i]))
+      if (length(value) != 1 || !is.finite(value)) NA_real_ else as.numeric(value)
+    },
+    numeric(1)
+  )
+}
+
+rolling_mean <- function(x, window) {
+  rolling_stat(x, window, function(v) mean(v, na.rm = TRUE))
+}
+
+# Rolling percentage meeting a condition, ignoring cases where the condition
+# cannot be evaluated.
+rolling_percent <- function(flag, window) {
+  rolling_stat(flag, window, function(v) {
+    v <- v[!is.na(v)]
+    if (!length(v)) return(NA_real_)
+    100 * mean(v)
+  })
+}
+
+prom_trend_metrics <- function() {
+  c(
+    "Mean follow-up score" = "followup_score",
+    "Mean pre-op score" = "preop_score",
+    "Mean change" = "change",
+    "Met MCID (%)" = "met_mcid",
+    "PASS rate (%)" = "met_pass"
+  )
+}
+
+prom_trend_metric_label <- function(metric) {
+  labels <- prom_trend_metrics()
+  hit <- names(labels)[match(metric, labels)]
+  ifelse(is.na(hit), metric, hit)
+}
+
+# Build the per-case series the trend chart and its table are drawn from.
+# `group_col` "overall" keeps one series; anything else produces one series per
+# group, each ordered and windowed independently.
+build_prom_trend_data <- function(change_df, window, mcid, pass_threshold,
+                                  group_col = "overall") {
+  if (is.null(change_df) || nrow(change_df) == 0) return(data.frame())
+
+  df <- change_df
+  df$case_date <- dplyr::coalesce(df$analysis_date, df$followup_date, df$preop_date)
+  df <- df %>% filter(!is.na(case_date))
+  if (nrow(df) == 0) return(data.frame())
+
+  df <- df %>%
+    mutate(
+      met_mcid = ifelse(is.na(change), NA, change >= mcid),
+      met_pass = if (length(pass_threshold) == 1 && !is.na(pass_threshold)) {
+        ifelse(is.na(followup_score), NA, followup_score >= pass_threshold)
+      } else {
+        NA
+      }
+    )
+
+  if (identical(group_col, "overall")) {
+    df$.group_value <- "All filtered cases"
+  } else {
+    df <- expand_group_column(df, group_col)
+    if (nrow(df) == 0) return(data.frame())
+  }
+
+  df %>%
+    group_by(.group_value) %>%
+    arrange(case_date, FORM_RESPONSE_GROUP_ID, .by_group = TRUE) %>%
+    mutate(
+      case_sequence = dplyr::row_number(),
+      group_cases = dplyr::n(),
+      `Mean follow-up score` = rolling_mean(followup_score, window),
+      `Mean pre-op score` = rolling_mean(preop_score, window),
+      `Mean change` = rolling_mean(change, window),
+      `Met MCID (%)` = rolling_percent(met_mcid, window),
+      `PASS rate (%)` = rolling_percent(met_pass, window)
+    ) %>%
+    ungroup()
+}
+
+# -----------------------------------------------------------------------------
+# Monitoring: CUSUM and funnel plots
+# -----------------------------------------------------------------------------
+# These are unadjusted. Neither chart knows anything about case mix, so a signal
+# means "this differs from the pooled cohort", NOT "this is poor care" — a
+# surgeon taking on worse baseline function or more complex cases will drift
+# towards a signal for that reason alone. Both are screening tools that say where
+# to look, never conclusions in themselves.
+
+prom_monitor_outcomes <- function() {
+  c(
+    "Met PASS" = "met_pass",
+    "Met MCID" = "met_mcid",
+    "Mean change" = "change",
+    "Mean follow-up score" = "followup_score"
+  )
+}
+
+prom_monitor_is_binary <- function(outcome) {
+  outcome %in% c("met_pass", "met_mcid")
+}
+
+prom_monitor_label <- function(outcome) {
+  labels <- prom_monitor_outcomes()
+  hit <- names(labels)[match(outcome, labels)]
+  if (length(hit) != 1 || is.na(hit)) outcome else hit
+}
+
+# A CUSUM is a random walk reflected at zero. Rather than iterate, use the
+# identity S_t = C_t - min(0, min_{j<=t} C_j) for the lower-reflected form (and
+# its mirror for the upper-reflected one), which is exact and vectorised.
+reflected_walk <- function(w, floor_at_zero = TRUE) {
+  if (!length(w)) return(numeric(0))
+  running <- cumsum(w)
+  if (floor_at_zero) {
+    running - pmin(0, cummin(running))
+  } else {
+    running - pmax(0, cummax(running))
+  }
+}
+
+# Expected number of cases between false signals when the true rate never moves
+# off p0. Without this an operator cannot tell whether a control limit is strict
+# or permissive, and h = 5 is far more permissive than it looks.
+cusum_in_control_arl <- function(p0, odds_ratio, limit, replications = 200,
+                                 max_cases = 20000, seed = 1) {
+  if (length(p0) != 1 || is.na(p0) || p0 <= 0 || p0 >= 1) return(NA_real_)
+  if (length(odds_ratio) != 1 || is.na(odds_ratio) || odds_ratio <= 1) return(NA_real_)
+  if (length(limit) != 1 || is.na(limit) || limit <= 0) return(NA_real_)
+
+  p1 <- odds_ratio * p0 / (1 - p0 + odds_ratio * p0)
+  w_fail <- log(p1 / p0)
+  w_succ <- log((1 - p1) / (1 - p0))
+
+  # Fixed seed so the figure does not jitter between redraws, and the caller's
+  # random stream is left exactly as it was found.
+  old_seed <- if (exists(".Random.seed", envir = .GlobalEnv)) {
+    get(".Random.seed", envir = .GlobalEnv)
+  } else {
+    NULL
+  }
+  set.seed(seed)
+  on.exit({
+    if (is.null(old_seed)) {
+      if (exists(".Random.seed", envir = .GlobalEnv)) rm(".Random.seed", envir = .GlobalEnv)
+    } else {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  # Each replication is one independent run of fixed length; a run that never
+  # crosses the limit is censored rather than extended, which would bias the mean.
+  run_lengths <- vapply(seq_len(replications), function(i) {
+    draws <- stats::rbinom(max_cases, 1, p0) == 1
+    walk <- reflected_walk(ifelse(draws, w_fail, w_succ), floor_at_zero = TRUE)
+    hit <- which(walk >= limit)
+    if (length(hit)) as.numeric(hit[[1]]) else NA_real_
+  }, numeric(1))
+
+  censored <- sum(is.na(run_lengths))
+  # With many runs never signalling, the mean of those that did is meaningless.
+  if (censored > replications * 0.1) return(NA_real_)
+  round(mean(run_lengths, na.rm = TRUE))
+}
+
+# Bernoulli CUSUM, Steiner et al., Biostatistics 2000.
+# `failure` is TRUE when the case did NOT achieve the outcome. The upper chart
+# accumulates evidence that the failure odds have risen by `odds_ratio`; the
+# lower chart accumulates the mirror-image evidence that they have fallen.
+bernoulli_cusum <- function(failure, p0, odds_ratio = 2, limit = 5) {
+  failure <- as.logical(failure)
+  keep <- !is.na(failure)
+  n <- sum(keep)
+  if (n == 0) return(data.frame())
+
+  # Weights are log-ratios, so a baseline rate of exactly 0 or 1 has no
+  # detectable alternative and the chart is undefined.
+  if (length(p0) != 1 || is.na(p0) || p0 <= 0 || p0 >= 1) return(data.frame())
+  if (length(odds_ratio) != 1 || is.na(odds_ratio) || odds_ratio <= 1) return(data.frame())
+
+  failure <- failure[keep]
+
+  weights_for <- function(ratio) {
+    p1 <- ratio * p0 / (1 - p0 + ratio * p0)
+    ifelse(failure, log(p1 / p0), log((1 - p1) / (1 - p0)))
+  }
+
+  w_up <- weights_for(odds_ratio)
+  w_down <- weights_for(1 / odds_ratio)
+
+  # Reset to zero after a signal, as standard CUSUM practice requires. Without
+  # it a single crossing leaves the chart flagged for every subsequent case, so
+  # one detection reads as hundreds and later changes are masked.
+  accumulate <- function(w, limit, upward) {
+    value <- numeric(n)
+    signal <- logical(n)
+    running <- 0
+    for (i in seq_len(n)) {
+      running <- if (upward) max(0, running + w[[i]]) else min(0, running + w[[i]])
+      crossed <- if (upward) running >= limit else running <= -limit
+      value[[i]] <- running
+      signal[[i]] <- crossed
+      if (crossed) running <- 0
+    }
+    list(value = value, signal = signal)
+  }
+
+  up <- accumulate(w_up, limit, upward = TRUE)
+  down <- accumulate(w_down, limit, upward = FALSE)
+
+  data.frame(
+    index = seq_len(n),
+    failure = failure,
+    upper = up$value,
+    lower = down$value,
+    signal_up = up$signal,
+    signal_down = down$signal,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Exact binomial funnel limits. The normal approximation misbehaves badly at the
+# low-volume end of a funnel, which is exactly where registry units sit, so use
+# the binomial quantiles directly and accept the stepped edge.
+funnel_limits_proportion <- function(n_grid, p_bar, alpha) {
+  n_grid <- unique(sort(n_grid[n_grid >= 1]))
+  if (!length(n_grid) || is.na(p_bar)) return(data.frame())
+
+  data.frame(
+    n = n_grid,
+    lower = 100 * stats::qbinom(alpha / 2, n_grid, p_bar) / n_grid,
+    upper = 100 * stats::qbinom(1 - alpha / 2, n_grid, p_bar) / n_grid,
+    alpha = alpha,
+    stringsAsFactors = FALSE
+  )
+}
+
+funnel_limits_mean <- function(n_grid, mean_bar, sd_pooled, alpha) {
+  n_grid <- unique(sort(n_grid[n_grid >= 1]))
+  if (!length(n_grid) || is.na(mean_bar) || is.na(sd_pooled) || sd_pooled <= 0) {
+    return(data.frame())
+  }
+
+  z <- stats::qnorm(1 - alpha / 2)
+  data.frame(
+    n = n_grid,
+    lower = mean_bar - z * sd_pooled / sqrt(n_grid),
+    upper = mean_bar + z * sd_pooled / sqrt(n_grid),
+    alpha = alpha,
+    stringsAsFactors = FALSE
+  )
+}
+
+# Per-group point estimates for the funnel, plus the pooled centre line.
+build_funnel_data <- function(df, outcome, group_col) {
+  if (is.null(df) || nrow(df) == 0 || identical(group_col, "overall")) return(NULL)
+
+  grouped <- expand_group_column(df, group_col)
+  if (nrow(grouped) == 0) return(NULL)
+
+  binary <- prom_monitor_is_binary(outcome)
+  grouped <- grouped %>% filter(!is.na(.data[[outcome]]))
+  if (nrow(grouped) == 0) return(NULL)
+
+  if (binary) {
+    points <- grouped %>%
+      group_by(.group_value) %>%
+      summarise(
+        n = dplyr::n(),
+        value = 100 * mean(.data[[outcome]], na.rm = TRUE),
+        .groups = "drop"
+      )
+    centre <- 100 * mean(grouped[[outcome]], na.rm = TRUE)
+    spread <- NA_real_
+  } else {
+    points <- grouped %>%
+      group_by(.group_value) %>%
+      summarise(
+        n = dplyr::n(),
+        value = mean(.data[[outcome]], na.rm = TRUE),
+        .groups = "drop"
+      )
+    centre <- mean(grouped[[outcome]], na.rm = TRUE)
+    spread <- stats::sd(grouped[[outcome]], na.rm = TRUE)
+  }
+
+  list(points = points, centre = centre, spread = spread, binary = binary)
+}
+
+# Flag each group against the limits so the table matches what the chart shows.
+funnel_flag_points <- function(points, centre, spread, binary, alpha) {
+  if (is.null(points) || nrow(points) == 0) return(data.frame())
+
+  limits <- if (binary) {
+    funnel_limits_proportion(points$n, centre / 100, alpha)
+  } else {
+    funnel_limits_mean(points$n, centre, spread, alpha)
+  }
+  if (nrow(limits) == 0) return(data.frame())
+
+  points %>%
+    left_join(limits, by = "n") %>%
+    mutate(
+      position = dplyr::case_when(
+        is.na(lower) | is.na(upper) ~ "Not assessable",
+        value > upper ~ "Above upper limit (better than cohort)",
+        value < lower ~ "Below lower limit (worse than cohort)",
+        TRUE ~ "Within limits"
+      )
+    )
+}
+
 summarise_duration <- function(df, group_cols = NULL) {
   if (is.null(df) || nrow(df) == 0 || !"surgical_duration_mins" %in% names(df)) {
     return(data.frame())
@@ -990,7 +1432,9 @@ case_core <- metadata_cases_enriched %>%
     case_proc_date = proc_date,
     case_hospital = ACCESS_POINT_NAME,
     case_source = `Case registry source`,
-    bmi = BMI
+    bmi = BMI,
+    case_age = age,
+    case_sex = Sex
   ) %>%
   distinct()
 
@@ -1039,6 +1483,24 @@ prepare_prom_data <- function(prom_type) {
     mutate(
       analysis_date = dplyr::coalesce(case_proc_date, event_date_parsed)
     )
+
+  # Sex and date of birth sit on the PROM record itself and are fully populated,
+  # so they survive a broken case link; BMI only exists on the case record.
+  prom_sex <- if ("Sex at Birth" %in% names(df)) tidy_sex_value(df$`Sex at Birth`) else NA_character_
+  case_sex <- if ("case_sex" %in% names(df)) tidy_sex_value(df$case_sex) else NA_character_
+  df$patient_sex <- dplyr::coalesce(prom_sex, case_sex)
+
+  # Age at procedure where the record links to the case table; otherwise age at
+  # the PROM event, which for a follow-up is older than age at surgery.
+  dob <- if ("Date of Birth" %in% names(df)) parse_date_flexible(df$`Date of Birth`) else as.Date(NA)
+  case_age <- if ("case_age" %in% names(df)) suppressWarnings(as.numeric(df$case_age)) else NA_real_
+  df$patient_age <- dplyr::coalesce(
+    case_age,
+    suppressWarnings(as.numeric(calc_age(dob, df$analysis_date)))
+  )
+
+  df$age_band <- band_age(df$patient_age)
+  df$bmi_band <- band_bmi(df$bmi)
 
   if ("Stage" %in% names(df)) {
     df$Stage <- factor(as.character(df$Stage), levels = stage_order, ordered = TRUE)
@@ -1392,6 +1854,11 @@ ui <- navbarPage(
         selectInput("prom_knee_system", "Knee system", choices = knee_system_choices),
         selectInput("prom_femoral_component", "Femoral component", choices = femoral_component_choices),
         selectInput("prom_acetabular_component", "Acetabular component", choices = acetabular_component_choices),
+        tags$hr(),
+        tags$div(class = "control-heading", "Patient demographics"),
+        uiOutput("prom_sex_ui"),
+        uiOutput("prom_age_ui"),
+        uiOutput("prom_bmi_ui"),
         selectInput(
           "prom_compare",
           "Compare scores by",
@@ -1402,7 +1869,10 @@ ui <- navbarPage(
             "Implant fixation type" = "fixation_type",
             "Knee system" = "knee_system",
             "Femoral component" = "femoral_component",
-            "Acetabular component" = "acetabular_component"
+            "Acetabular component" = "acetabular_component",
+            "Sex" = "patient_sex",
+            "Age band" = "age_band",
+            "BMI band" = "bmi_band"
           )
         ),
         selectizeInput(
@@ -1415,17 +1885,64 @@ ui <- navbarPage(
         tags$div(class = "control-heading", "Score thresholds"),
         uiOutput("prom_pass_ui"),
         conditionalPanel(
-          condition = "input.prom_view == 'change'",
+          condition = "input.prom_view == 'change' || input.prom_view == 'trends' || input.prom_view == 'monitoring'",
           uiOutput("prom_change_mcid_ui")
         ),
         conditionalPanel(
-          condition = "input.prom_view == 'change'",
+          condition = "input.prom_view == 'change' || input.prom_view == 'trends' || input.prom_view == 'monitoring'",
           tags$hr(),
-          tags$div(class = "control-heading", "Pre-op vs post-op change"),
+          tags$div(class = "control-heading", "Paired analysis"),
           uiOutput("prom_change_stage_ui"),
           tags$p(
             class = "help-note",
             "Change = follow-up score minus pre-op score for the same case and side, so a positive change is an improvement. The Stage filter above does not apply here — the paired analysis always needs both stages."
+          )
+        ),
+        conditionalPanel(
+          condition = "input.prom_view == 'monitoring'",
+          tags$hr(),
+          tags$div(class = "control-heading", "Monitoring"),
+          selectInput(
+            "prom_monitor_outcome",
+            "Outcome",
+            choices = prom_monitor_outcomes(),
+            selected = "met_pass"
+          ),
+          sliderInput(
+            "prom_monitor_alpha",
+            "Funnel limits",
+            min = 1, max = 3, value = 2, step = 1,
+            ticks = FALSE
+          ),
+          tags$p(class = "help-note", "1 = 95% only, 2 = 95% and 99.8%, 3 = 99.8% only."),
+          numericInput("prom_cusum_or", "CUSUM: odds ratio to detect", value = 2, min = 1.1, step = 0.5),
+          numericInput("prom_cusum_limit", "CUSUM: control limit (h)", value = 5, min = 1, step = 0.5),
+          uiOutput("prom_cusum_baseline_ui"),
+          tags$p(
+            class = "help-note",
+            "Neither chart adjusts for case mix. A signal says a group or a run differs from the pooled cohort, not that care was worse."
+          )
+        ),
+        conditionalPanel(
+          condition = "input.prom_view == 'trends'",
+          tags$hr(),
+          tags$div(class = "control-heading", "Rolling trend"),
+          uiOutput("prom_trend_window_ui"),
+          checkboxGroupInput(
+            "prom_trend_metrics",
+            "Metrics to plot",
+            choices = prom_trend_metrics(),
+            selected = c("followup_score", "change", "met_mcid", "met_pass")
+          ),
+          radioButtons(
+            "prom_trend_xaxis",
+            "Plot against",
+            choices = c("Case sequence" = "sequence", "Procedure date" = "date"),
+            selected = "sequence"
+          ),
+          tags$p(
+            class = "help-note",
+            "Cases are ordered by procedure date. Each point averages that case and the preceding cases in the window, so a trend only starts once a full window of cases exists. Series are split by the Compare scores by selection above."
           )
         ),
         tags$p(
@@ -1436,6 +1953,7 @@ ui <- navbarPage(
       ),
       mainPanel(
         uiOutput("prom_link_note"),
+        uiOutput("prom_demographics_note"),
         tabsetPanel(
           id = "prom_view",
           tabPanel(
@@ -1484,6 +2002,33 @@ ui <- navbarPage(
             downloadButton("download_prom_change", "Download paired change data"),
             tags$br(), tags$br(),
             DTOutput("prom_change_case_table")
+          ),
+          tabPanel(
+            "Trends",
+            value = "trends",
+            uiOutput("prom_trend_note"),
+            uiOutput("prom_trend_metrics_boxes"),
+            plotOutput("prom_trend_plot", height = 520),
+            h4("First vs most recent window"),
+            uiOutput("prom_trend_shift_note"),
+            DTOutput("prom_trend_shift_table"),
+            h4("Rolling series"),
+            downloadButton("download_prom_trend", "Download rolling series"),
+            tags$br(), tags$br(),
+            DTOutput("prom_trend_table")
+          ),
+          tabPanel(
+            "Monitoring",
+            value = "monitoring",
+            uiOutput("prom_monitor_caveat"),
+            h4("Funnel plot"),
+            uiOutput("prom_funnel_note"),
+            plotOutput("prom_funnel_plot", height = 460),
+            DTOutput("prom_funnel_table"),
+            h4("CUSUM"),
+            uiOutput("prom_cusum_note"),
+            plotOutput("prom_cusum_plot", height = 460),
+            DTOutput("prom_cusum_table")
           )
         )
       )
@@ -1638,19 +2183,67 @@ ui <- navbarPage(
             "Source" = "source"
           )
         ),
+        conditionalPanel(
+          condition = "input.surg_view == 'trend'",
+          tags$hr(),
+          tags$div(class = "control-heading", "Rolling trend"),
+          uiOutput("surg_trend_window_ui"),
+          checkboxGroupInput(
+            "surg_trend_metrics",
+            "Metrics to plot",
+            choices = c(
+              "Mean duration" = "mean",
+              "Median duration" = "median",
+              "Variability (SD)" = "sd",
+              "Long cases (%)" = "long"
+            ),
+            selected = c("mean", "median", "long")
+          ),
+          numericInput("surg_long_threshold", "Long case threshold (minutes)", value = 120, min = 1, step = 10),
+          radioButtons(
+            "surg_trend_xaxis",
+            "Plot against",
+            choices = c("Case sequence" = "sequence", "Procedure date" = "date"),
+            selected = "sequence"
+          ),
+          tags$p(
+            class = "help-note",
+            "Cases are ordered by procedure date. Each point covers that case and the preceding cases in the window. Series are split by the Compare duration by selection above."
+          )
+        ),
         downloadButton("download_surgical", "Download filtered surgical times")
       ),
       mainPanel(
         uiOutput("surg_link_note"),
-        uiOutput("surg_metrics"),
-        fluidRow(
-          column(6, plotOutput("surg_hist_plot", height = 300)),
-          column(6, plotOutput("surg_compare_plot", height = 300))
-        ),
-        h4("Duration summary"),
-        DTOutput("surg_summary_table"),
-        h4("Filtered surgical timing records"),
-        DTOutput("surg_raw_table")
+        tabsetPanel(
+          id = "surg_view",
+          tabPanel(
+            "Distribution and comparison",
+            value = "distribution",
+            uiOutput("surg_metrics"),
+            fluidRow(
+              column(6, plotOutput("surg_hist_plot", height = 300)),
+              column(6, plotOutput("surg_compare_plot", height = 300))
+            ),
+            h4("Duration summary"),
+            DTOutput("surg_summary_table"),
+            h4("Filtered surgical timing records"),
+            DTOutput("surg_raw_table")
+          ),
+          tabPanel(
+            "Rolling trend",
+            value = "trend",
+            uiOutput("surg_trend_note"),
+            uiOutput("surg_trend_boxes"),
+            plotOutput("surg_trend_plot", height = 520),
+            h4("First vs most recent window"),
+            DTOutput("surg_trend_shift_table"),
+            h4("Rolling series"),
+            downloadButton("download_surg_trend", "Download rolling series"),
+            tags$br(), tags$br(),
+            DTOutput("surg_trend_table")
+          )
+        )
       )
     )
   ),
@@ -1974,6 +2567,82 @@ server <- function(input, output, session) {
     updateSelectizeInput(session, "prom_case_id", choices = choices, selected = head(choices, 1), server = TRUE)
   })
 
+  # ---------------------------------------------------------------------------
+  # Patient demographic filters
+  # ---------------------------------------------------------------------------
+
+  output$prom_sex_ui <- renderUI({
+    req(input$prom_type)
+    values <- tidy_sex_value(prepare_prom_data(input$prom_type)$patient_sex)
+    selectInput("prom_sex", "Sex", choices = make_choice_vector(values))
+  })
+
+  output$prom_age_ui <- renderUI({
+    req(input$prom_type)
+    df <- prepare_prom_data(input$prom_type)
+    bounds <- numeric_bounds(df$patient_age)
+    if (is.null(bounds)) {
+      return(tags$p(class = "help-note", "No usable age values were found for this dataset."))
+    }
+    missing <- sum(is.na(df$patient_age))
+    tagList(
+      sliderInput("prom_age_range", "Age at procedure", min = bounds$min, max = bounds$max,
+                  value = c(bounds$min, bounds$max), step = 1),
+      if (missing > 0) {
+        checkboxInput("prom_age_include_missing",
+                      sprintf("Include records with no age (%s in this dataset)", format(missing, big.mark = ",")),
+                      value = TRUE)
+      }
+    )
+  })
+
+  output$prom_bmi_ui <- renderUI({
+    req(input$prom_type)
+    df <- prepare_prom_data(input$prom_type)
+    bounds <- numeric_bounds(df$bmi)
+    if (is.null(bounds)) {
+      return(tags$p(class = "help-note", "No usable BMI values were found for this dataset."))
+    }
+    missing <- sum(is.na(df$bmi))
+    tagList(
+      sliderInput("prom_bmi_range", "BMI", min = bounds$min, max = bounds$max,
+                  value = c(bounds$min, bounds$max), step = 1),
+      if (missing > 0) {
+        checkboxInput("prom_bmi_include_missing",
+                      sprintf("Include records with no BMI (%s in this dataset)", format(missing, big.mark = ",")),
+                      value = TRUE)
+      }
+    )
+  })
+
+  output$prom_demographics_note <- renderUI({
+    req(input$prom_type)
+    df <- filtered_prom_all_stages()
+    if (nrow(df) == 0) return(NULL)
+
+    total <- nrow(df)
+    age <- df$patient_age[!is.na(df$patient_age)]
+    bmi <- df$bmi[!is.na(df$bmi)]
+    sex <- tidy_sex_value(df$patient_sex)
+    female <- sum(!is.na(sex) & tolower(sex) == "female")
+    sex_known <- sum(!is.na(sex))
+
+    parts <- c(
+      sprintf("%s records", format(total, big.mark = ",")),
+      if (length(age)) {
+        sprintf("mean age %.1f (range %s-%s)%s", mean(age), min(age), max(age),
+                if (length(age) < total) sprintf(", %s with no age", format(total - length(age), big.mark = ",")) else "")
+      },
+      if (sex_known > 0) sprintf("%.1f%% female", 100 * female / sex_known),
+      if (length(bmi)) {
+        sprintf("mean BMI %.1f%s", mean(bmi),
+                if (length(bmi) < total) sprintf(", %s with no BMI", format(total - length(bmi), big.mark = ",")) else "")
+      }
+    )
+
+    tags$p(class = "help-note", paste(parts[!vapply(parts, is.null, logical(1))], collapse = " | "))
+  })
+
   # Every PROM filter except Stage. The paired change analysis needs the pre-op
   # and follow-up rows for a case to survive together, so it starts from here.
   filtered_prom_all_stages <- reactive({
@@ -1995,6 +2664,12 @@ server <- function(input, output, session) {
     df <- apply_component_filter(df, "knee_system", input$prom_knee_system)
     df <- apply_component_filter(df, "femoral_component", input$prom_femoral_component)
     df <- apply_component_filter(df, "acetabular_component", input$prom_acetabular_component)
+
+    df <- apply_single_filter(df, "patient_sex", input$prom_sex)
+    df <- apply_range_filter(df, "patient_age", input$prom_age_range,
+                             include_missing = input$prom_age_include_missing %||% TRUE)
+    df <- apply_range_filter(df, "bmi", input$prom_bmi_range,
+                             include_missing = input$prom_bmi_include_missing %||% TRUE)
 
     df %>% arrange(Stage, analysis_date, event_date_parsed)
   })
@@ -2046,10 +2721,16 @@ server <- function(input, output, session) {
     postop_df <- prom_postop_records(df)
     pass_value <- pass_rate(postop_df$Score, threshold)
     pass_display <- if (is.na(pass_value)) "NA" else paste0(pass_value, "%")
+    n_stages <- length(unique(stats::na.omit(as.character(postop_df$Stage))))
     pass_subtitle <- if (is.na(threshold)) {
       "Set a PASS threshold in the sidebar"
     } else {
-      sprintf("%s+ at follow-up (%s records, pre-op excluded)", threshold, format(nrow(postop_df), big.mark = ","))
+      sprintf(
+        "%s+ across %s, all records (n=%s)",
+        threshold,
+        if (n_stages == 1) "1 follow-up stage" else paste(n_stages, "follow-up stages pooled"),
+        format(nrow(postop_df), big.mark = ",")
+      )
     }
 
     fluidRow(
@@ -2183,6 +2864,9 @@ server <- function(input, output, session) {
       `First Name` = df$`First Name`,
       `Last Name` = df$`Last Name`,
       Laterality = if ("Laterality" %in% names(df)) df$Laterality else NA_character_,
+      Sex = df$patient_sex,
+      Age = df$patient_age,
+      BMI = df$bmi,
       Stage = if ("Stage" %in% names(df)) as.character(df$Stage) else NA_character_,
       Score = df$Score,
       `Filter date` = as.character(df$analysis_date),
@@ -2256,7 +2940,7 @@ server <- function(input, output, session) {
     tags$p(
       class = "help-note",
       sprintf(
-        "PASS rate = the share of records scoring %s or above on the %s. Unlike the MCID this is an absolute score, so it needs no pre-op baseline. The headline rate and the group comparison use follow-up records only — a group's mix of stages would otherwise masquerade as a difference in outcome. Pre-op appears in the by-stage breakdown below as a reference point.",
+        "PASS rate = the share of records scoring %s or above on the %s. Unlike the MCID this is an absolute score, so it needs no pre-op baseline. Everything here counts every follow-up record, pre-op excluded, and is broken down by stage — PASS climbs with time since surgery, so a group's mix of follow-up stages would otherwise masquerade as a difference in outcome. The Pre-op vs post-op change tab reports PASS for one stage and for paired cases only, so its figures are lower; that is the cohort differing, not the calculation.",
         threshold, prom_score_label(input$prom_type)
       )
     )
@@ -2320,12 +3004,14 @@ server <- function(input, output, session) {
     if (nrow(grouped_df) == 0) return(data.frame())
 
     summary_df <- grouped_df %>%
-      group_by(.group_value) %>%
+      mutate(Stage = factor(as.character(Stage), levels = prom_followup_stages, ordered = TRUE)) %>%
+      group_by(.group_value, Stage) %>%
       summarise(
         Records = dplyr::n(),
         `PASS (%)` = pass_rate(Score, threshold),
         .groups = "drop"
-      )
+      ) %>%
+      arrange(.group_value, Stage)
 
     rename_group_column(summary_df, friendly_group_label(compare_col))
   })
@@ -2366,25 +3052,39 @@ server <- function(input, output, session) {
     validate(need(nrow(summary_df) > 0, "No linked PROM rows are available for the selected comparison."))
 
     label <- friendly_group_label(compare_col)
-    plot_df <- summary_df %>%
-      arrange(desc(Records)) %>%
-      slice_head(n = 12) %>%
-      mutate(group_label = factor(.data[[label]], levels = .data[[label]][order(`PASS (%)`)]))
 
-    ggplot(plot_df, aes(x = `PASS (%)`, y = group_label)) +
-      geom_col(fill = "#0ea5e9") +
-      geom_text(aes(label = paste0(`PASS (%)`, "% (n=", Records, ")")), hjust = -0.05, size = 3.2, colour = "#64748b") +
+    # Rank groups by total records, but order the bars by the group's overall
+    # PASS rate so the chart still reads top to bottom.
+    group_totals <- summary_df %>%
+      group_by(.data[[label]]) %>%
+      summarise(
+        total_records = sum(Records, na.rm = TRUE),
+        overall_pass = stats::weighted.mean(`PASS (%)`, Records, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(total_records)) %>%
+      slice_head(n = 10)
+
+    plot_df <- summary_df %>%
+      filter(.data[[label]] %in% group_totals[[label]]) %>%
+      left_join(group_totals, by = label) %>%
+      mutate(group_label = stats::reorder(.data[[label]], overall_pass))
+
+    ggplot(plot_df, aes(x = `PASS (%)`, y = group_label, fill = Stage)) +
+      geom_col(position = position_dodge(width = 0.8), width = 0.75) +
+      scale_fill_manual(values = prom_stage_palette(), drop = TRUE) +
       scale_x_continuous(
-        limits = c(0, 118),
+        limits = c(0, 100),
         breaks = seq(0, 100, 25),
-        expand = ggplot2::expansion(mult = c(0, 0))
+        expand = ggplot2::expansion(mult = c(0, 0.02))
       ) +
       labs(
-        title = paste("PASS rate by", tolower(label)),
-        subtitle = "Follow-up records only, stages pooled; up to 12 groups with the most records",
-        x = "% of records at or above threshold", y = NULL
+        title = paste("PASS rate by", tolower(label), "and stage"),
+        subtitle = "Follow-up records only; up to 10 groups with the most records",
+        x = "% of records at or above threshold", y = NULL, fill = NULL
       ) +
-      theme_minimal(base_size = 12)
+      theme_minimal(base_size = 12) +
+      theme(legend.position = "top")
   })
 
   output$prom_pass_stage_table <- renderDT({
@@ -2403,9 +3103,16 @@ server <- function(input, output, session) {
 
     tags$p(
       class = "help-note",
-      sprintf(
-        "MCID asks whether a patient gained enough (change of %s or more); PASS asks whether their state is acceptable now (%s or above at follow-up). A patient starting from a very low baseline can clear the MCID and still fall short of PASS.",
-        prom_change_mcid(), threshold
+      tagList(
+        sprintf(
+          "MCID asks whether a patient gained enough (change of %s or more); PASS asks whether their state is acceptable now (%s or above at follow-up). A patient starting from a very low baseline can clear the MCID and still fall short of PASS.",
+          prom_change_mcid(), threshold
+        ),
+        tags$br(),
+        sprintf(
+          "Every PASS figure on this tab covers one stage (%s) and only cases that also have a pre-op baseline, so it will not match the Scores by stage tab, which counts every follow-up record across all selected stages.",
+          tolower(input$prom_change_stage %||% "the selected follow-up stage")
+        )
       )
     )
   })
@@ -2540,7 +3247,7 @@ server <- function(input, output, session) {
     pass_subtitle <- if (is.na(threshold)) {
       "Set a PASS threshold in the sidebar"
     } else {
-      sprintf("Follow-up score of %s or above", threshold)
+      sprintf("%s+ at %s, paired cases only", threshold, tolower(input$prom_change_stage %||% "follow-up"))
     }
 
     fluidRow(
@@ -2739,6 +3446,9 @@ server <- function(input, output, session) {
       `First Name` = df$`First Name`,
       `Last Name` = df$`Last Name`,
       Side = df$pair_side,
+      Sex = df$patient_sex,
+      Age = df$patient_age,
+      BMI = df$bmi,
       `Follow-up stage` = as.character(df$followup_stage),
       `Pre-op score` = df$preop_score,
       `Follow-up score` = df$followup_score,
@@ -2774,6 +3484,794 @@ server <- function(input, output, session) {
     content = function(file) write_export(prom_change_display(), file)
   )
 
+
+  # ---------------------------------------------------------------------------
+  # Rolling trends
+  # ---------------------------------------------------------------------------
+
+  # The window can never exceed the cases available, or every point would be NA.
+  prom_trend_max_window <- reactive({
+    n <- nrow(prom_change_data())
+    if (n < 10) return(0L)
+    as.integer(min(400, floor(n / 2)))
+  })
+
+  output$prom_trend_window_ui <- renderUI({
+    max_window <- prom_trend_max_window()
+    if (max_window < 5) {
+      return(tags$p(class = "help-note", "Not enough paired cases at this stage to draw a rolling trend."))
+    }
+
+    default <- max(5L, min(50L, max_window))
+    sliderInput(
+      "prom_trend_window",
+      "Rolling window (cases)",
+      min = 5,
+      max = max_window,
+      value = default,
+      step = 5
+    )
+  })
+
+  prom_trend_window <- reactive({
+    max_window <- prom_trend_max_window()
+    if (max_window < 5) return(NA_integer_)
+    value <- suppressWarnings(as.integer(input$prom_trend_window))
+    if (length(value) != 1 || is.na(value)) return(max(5L, min(50L, max_window)))
+    max(5L, min(value, max_window))
+  })
+
+  prom_trend_data <- reactive({
+    req(input$prom_type)
+    window <- prom_trend_window()
+    if (is.na(window)) return(data.frame())
+
+    build_prom_trend_data(
+      prom_change_data(),
+      window = window,
+      mcid = prom_change_mcid(),
+      pass_threshold = prom_pass_threshold(),
+      group_col = input$prom_compare %||% "overall"
+    )
+  })
+
+  # Long form, one row per case per selected metric, for faceting.
+  prom_trend_long <- reactive({
+    df <- prom_trend_data()
+    selected <- input$prom_trend_metrics %||% character(0)
+    if (nrow(df) == 0 || !length(selected)) return(data.frame())
+
+    metric_labels <- prom_trend_metric_label(selected)
+    present <- metric_labels[metric_labels %in% names(df)]
+    if (!length(present)) return(data.frame())
+
+    df %>%
+      select(
+        .group_value, case_sequence, case_date, group_cases,
+        FORM_RESPONSE_GROUP_ID, all_of(present)
+      ) %>%
+      tidyr::pivot_longer(
+        cols = all_of(present),
+        names_to = "Metric",
+        values_to = "Value"
+      ) %>%
+      filter(!is.na(Value)) %>%
+      mutate(Metric = factor(Metric, levels = present))
+  })
+
+  output$prom_trend_note <- renderUI({
+    req(input$prom_type)
+    window <- prom_trend_window()
+    stage <- input$prom_change_stage %||% "the selected follow-up stage"
+
+    if (is.na(window)) {
+      return(tags$div(
+        class = "notice-box",
+        sprintf(
+          "Fewer than 10 paired cases at %s under the current filters, so there is nothing to trend. Widen the date range, clear a filter, or pick another follow-up stage.",
+          tolower(stage)
+        )
+      ))
+    }
+
+    df <- prom_trend_data()
+    if (nrow(df) == 0) {
+      return(tags$div(class = "notice-box", "No paired cases are available for the selected comparison."))
+    }
+
+    short_groups <- df %>%
+      distinct(.group_value, group_cases) %>%
+      filter(group_cases < window)
+
+    messages <- sprintf(
+      "Rolling average of %s cases, ordered by procedure date, over %s paired cases at %s. Each point covers that case and the %s before it.",
+      window, format(nrow(df), big.mark = ","), tolower(stage), window - 1
+    )
+
+    if (nrow(short_groups) > 0) {
+      messages <- c(
+        messages,
+        sprintf(
+          "%s group(s) have fewer than %s cases and so produce no line: %s.",
+          nrow(short_groups), window,
+          paste(utils::head(short_groups$.group_value, 5), collapse = ", ")
+        )
+      )
+    }
+
+    tags$div(
+      class = if (nrow(short_groups) > 0) "notice-box" else "success-box",
+      tags$ul(lapply(messages, tags$li))
+    )
+  })
+
+  output$prom_trend_metrics_boxes <- renderUI({
+    req(input$prom_type)
+    df <- prom_trend_data()
+    window <- prom_trend_window()
+    if (nrow(df) == 0 || is.na(window)) return(NULL)
+
+    digits <- prom_score_digits(input$prom_type)
+
+    # Compare the earliest complete window against the most recent one, pooling
+    # groups so the headline reads on the whole filtered cohort.
+    overall <- df %>% arrange(case_date, FORM_RESPONSE_GROUP_ID)
+    first_window <- utils::head(overall, window)
+    last_window <- utils::tail(overall, window)
+
+    shift_box <- function(title, first_value, last_value, digits, suffix = "") {
+      delta <- last_value - first_value
+      metric_box(
+        title,
+        paste0(round(last_value, digits), suffix),
+        sprintf(
+          "%s%s%s vs first %s cases (%s%s)",
+          if (is.na(delta)) "" else if (delta > 0) "+" else "",
+          if (is.na(delta)) "NA" else round(delta, digits),
+          suffix, window, round(first_value, digits), suffix
+        )
+      )
+    }
+
+    fluidRow(
+      column(3, shift_box("Mean follow-up score", mean(first_window$followup_score, na.rm = TRUE), mean(last_window$followup_score, na.rm = TRUE), digits)),
+      column(3, shift_box("Mean change", mean(first_window$change, na.rm = TRUE), mean(last_window$change, na.rm = TRUE), digits)),
+      column(3, shift_box("Met MCID", 100 * mean(first_window$met_mcid, na.rm = TRUE), 100 * mean(last_window$met_mcid, na.rm = TRUE), 1, "%")),
+      column(3, shift_box("PASS rate", 100 * mean(first_window$met_pass, na.rm = TRUE), 100 * mean(last_window$met_pass, na.rm = TRUE), 1, "%"))
+    )
+  })
+
+  output$prom_trend_plot <- renderPlot({
+    req(input$prom_type)
+    plot_df <- prom_trend_long()
+    validate(need(nrow(plot_df) > 0, "Select at least one metric, and make sure enough paired cases exist for the chosen window."))
+
+    compare_col <- input$prom_compare %||% "overall"
+    single_series <- identical(compare_col, "overall")
+    window <- prom_trend_window()
+
+    # Cap the number of series so a consultant-level split stays legible.
+    if (!single_series) {
+      top_groups <- plot_df %>%
+        distinct(.group_value, group_cases) %>%
+        arrange(desc(group_cases)) %>%
+        slice_head(n = 8)
+      plot_df <- plot_df %>% filter(.group_value %in% top_groups$.group_value)
+      validate(need(nrow(plot_df) > 0, "No group has enough cases for the chosen window."))
+    }
+
+    x_by_date <- identical(input$prom_trend_xaxis %||% "sequence", "date")
+    plot_df$x <- if (x_by_date) plot_df$case_date else plot_df$case_sequence
+
+    # Whole-cohort mean per metric, so it is obvious when a window sits above or
+    # below the cohort's own average rather than an arbitrary zero.
+    cohort <- prom_trend_data()
+    reference_df <- data.frame(
+      Metric = c("Mean follow-up score", "Mean pre-op score", "Mean change", "Met MCID (%)", "PASS rate (%)"),
+      Value = c(
+        mean(cohort$followup_score, na.rm = TRUE),
+        mean(cohort$preop_score, na.rm = TRUE),
+        mean(cohort$change, na.rm = TRUE),
+        100 * mean(cohort$met_mcid, na.rm = TRUE),
+        100 * mean(cohort$met_pass, na.rm = TRUE)
+      ),
+      stringsAsFactors = FALSE
+    ) %>%
+      filter(Metric %in% levels(plot_df$Metric), is.finite(Value)) %>%
+      mutate(Metric = factor(Metric, levels = levels(plot_df$Metric)))
+
+    p <- ggplot(plot_df, aes(x = x, y = Value))
+
+    if (nrow(reference_df) > 0) {
+      p <- p + geom_hline(
+        data = reference_df,
+        aes(yintercept = Value),
+        linetype = "dashed",
+        colour = "#94a3b8",
+        linewidth = 0.6
+      )
+    }
+
+    if (single_series) {
+      p <- p + geom_line(linewidth = 0.8, colour = "#1d4ed8")
+    } else {
+      p <- p +
+        geom_line(aes(colour = .group_value), linewidth = 0.7) +
+        labs(colour = NULL)
+    }
+
+    p +
+      facet_wrap(~Metric, ncol = 2, scales = "free_y") +
+      labs(
+        title = sprintf("Rolling average of %s cases", window),
+        subtitle = sprintf(
+          "Paired cases at %s, ordered by procedure date",
+          tolower(input$prom_change_stage %||% "the selected follow-up stage")
+        ),
+        x = if (x_by_date) "Procedure date of most recent case in window" else "Case sequence",
+        y = NULL,
+        caption = paste0(
+          "Dashed line = mean across all filtered paired cases.",
+          if (!single_series && !x_by_date) " Each series is numbered from its own first case, so series are not aligned in time — switch to procedure date to compare calendar periods." else ""
+        )
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        legend.position = if (single_series) "none" else "top",
+        panel.spacing = grid::unit(1, "lines"),
+        plot.caption = element_text(colour = "#64748b", hjust = 0)
+      )
+  })
+
+  prom_trend_shift <- reactive({
+    req(input$prom_type)
+    df <- prom_trend_data()
+    window <- prom_trend_window()
+    if (nrow(df) == 0 || is.na(window)) return(data.frame())
+
+    digits <- prom_score_digits(input$prom_type)
+
+    df %>%
+      group_by(.group_value) %>%
+      arrange(case_date, FORM_RESPONSE_GROUP_ID, .by_group = TRUE) %>%
+      filter(dplyr::n() >= window) %>%
+      summarise(
+        Cases = dplyr::n(),
+        `First window: mean score` = round(mean(utils::head(followup_score, window), na.rm = TRUE), digits),
+        `Latest window: mean score` = round(mean(utils::tail(followup_score, window), na.rm = TRUE), digits),
+        `First window: mean change` = round(mean(utils::head(change, window), na.rm = TRUE), digits),
+        `Latest window: mean change` = round(mean(utils::tail(change, window), na.rm = TRUE), digits),
+        `First window: MCID (%)` = round(100 * mean(utils::head(met_mcid, window), na.rm = TRUE), 1),
+        `Latest window: MCID (%)` = round(100 * mean(utils::tail(met_mcid, window), na.rm = TRUE), 1),
+        `First window: PASS (%)` = round(100 * mean(utils::head(met_pass, window), na.rm = TRUE), 1),
+        `Latest window: PASS (%)` = round(100 * mean(utils::tail(met_pass, window), na.rm = TRUE), 1),
+        .groups = "drop"
+      ) %>%
+      rename_group_column(friendly_group_label(input$prom_compare %||% "overall"))
+  })
+
+  output$prom_trend_shift_note <- renderUI({
+    window <- prom_trend_window()
+    if (is.na(window)) return(NULL)
+    tags$p(
+      class = "help-note",
+      sprintf(
+        "The first and last %s cases of each series, side by side. This is a crude before-and-after on two windows, not a test for trend — read it alongside the chart rather than instead of it, and treat small groups with caution.",
+        window
+      )
+    )
+  })
+
+  output$prom_trend_shift_table <- renderDT({
+    datatable_or_message(
+      prom_trend_shift(),
+      "Not enough paired cases for the chosen window."
+    )
+  })
+
+  prom_trend_display <- reactive({
+    req(input$prom_type)
+    df <- prom_trend_data()
+    if (nrow(df) == 0) return(data.frame())
+
+    digits <- prom_score_digits(input$prom_type)
+    group_label <- friendly_group_label(input$prom_compare %||% "overall")
+
+    out <- data.frame(
+      Series = df$.group_value,
+      `Case sequence` = df$case_sequence,
+      `Procedure date` = as.character(df$case_date),
+      FORM_RESPONSE_GROUP_ID = df$FORM_RESPONSE_GROUP_ID,
+      Side = df$pair_side,
+      `Pre-op score` = df$preop_score,
+      `Follow-up score` = df$followup_score,
+      Change = df$change,
+      `Met MCID` = ifelse(is.na(df$met_mcid), NA, ifelse(df$met_mcid, "Yes", "No")),
+      `Met PASS` = ifelse(is.na(df$met_pass), NA, ifelse(df$met_pass, "Yes", "No")),
+      `Rolling mean follow-up score` = round(df$`Mean follow-up score`, digits),
+      `Rolling mean pre-op score` = round(df$`Mean pre-op score`, digits),
+      `Rolling mean change` = round(df$`Mean change`, digits),
+      `Rolling MCID (%)` = round(df$`Met MCID (%)`, 1),
+      `Rolling PASS (%)` = round(df$`PASS rate (%)`, 1),
+      Consultant = df$consultant,
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+
+    names(out)[names(out) == "Series"] <- group_label
+    out
+  })
+
+  output$prom_trend_table <- renderDT({
+    datatable_or_message(
+      prom_trend_display(),
+      "No paired cases available for a rolling trend under the current filters."
+    )
+  })
+
+  output$download_prom_trend <- downloadHandler(
+    filename = function() {
+      paste0("inor_proms_trend_", input$prom_type, "_", Sys.Date(), ".csv")
+    },
+    content = function(file) write_export(prom_trend_display(), file)
+  )
+
+  # ---------------------------------------------------------------------------
+  # Monitoring: funnel plot and CUSUM
+  # ---------------------------------------------------------------------------
+
+  prom_monitor_base <- reactive({
+    req(input$prom_type)
+    df <- prom_change_data()
+    if (nrow(df) == 0) return(df)
+
+    mcid <- prom_change_mcid()
+    threshold <- prom_pass_threshold()
+
+    df %>%
+      mutate(
+        met_mcid = ifelse(is.na(change), NA, change >= mcid),
+        met_pass = if (length(threshold) == 1 && !is.na(threshold)) {
+          ifelse(is.na(followup_score), NA, followup_score >= threshold)
+        } else {
+          NA
+        }
+      )
+  })
+
+  prom_monitor_outcome <- reactive({
+    outcome <- input$prom_monitor_outcome %||% "met_pass"
+    if (!outcome %in% prom_monitor_outcomes()) "met_pass" else outcome
+  })
+
+  prom_monitor_alphas <- reactive({
+    switch(
+      as.character(input$prom_monitor_alpha %||% 2),
+      "1" = 0.05,
+      "3" = 0.002,
+      c(0.05, 0.002)
+    )
+  })
+
+  output$prom_monitor_caveat <- renderUI({
+    tags$div(
+      class = "notice-box",
+      tags$b("Neither chart adjusts for case mix."),
+      " A funnel point outside the limits, or a CUSUM crossing, means that group or that run differs from the pooled cohort under the current filters. It is not evidence that care was worse: a surgeon operating on patients with lower baseline function, more complex deformity, or higher comorbidity will drift towards a signal for those reasons alone. Treat both as a prompt to look, never as a conclusion."
+    )
+  })
+
+  # -- Funnel ----------------------------------------------------------------
+
+  prom_funnel_parts <- reactive({
+    req(input$prom_type)
+    build_funnel_data(
+      prom_monitor_base(),
+      prom_monitor_outcome(),
+      input$prom_compare %||% "overall"
+    )
+  })
+
+  output$prom_funnel_note <- renderUI({
+    compare_col <- input$prom_compare %||% "overall"
+    if (identical(compare_col, "overall")) {
+      return(tags$div(
+        class = "notice-box",
+        "A funnel plot compares units against each other, so choose something other than Overall under Compare scores by — consultant, surgeon grade, fixation type or a component."
+      ))
+    }
+
+    parts <- prom_funnel_parts()
+    if (is.null(parts)) {
+      return(tags$div(class = "notice-box", "No linked rows are available for the selected comparison."))
+    }
+
+    outcome <- prom_monitor_outcome()
+    digits <- if (prom_monitor_is_binary(outcome)) 1 else prom_score_digits(input$prom_type)
+
+    tags$p(
+      class = "help-note",
+      sprintf(
+        "%s by %s, across %s groups and %s paired cases at %s. Centre line = pooled %s (%s%s). Limits are %s, drawn from the exact binomial distribution for a proportion so they stay honest at low volume.",
+        prom_monitor_label(outcome),
+        tolower(friendly_group_label(compare_col)),
+        nrow(parts$points),
+        format(sum(parts$points$n), big.mark = ","),
+        tolower(input$prom_change_stage %||% "the selected stage"),
+        tolower(prom_monitor_label(outcome)),
+        round(parts$centre, digits),
+        if (parts$binary) "%" else "",
+        paste(ifelse(prom_monitor_alphas() == 0.05, "95%", "99.8%"), collapse = " and ")
+      )
+    )
+  })
+
+  output$prom_funnel_plot <- renderPlot({
+    req(input$prom_type)
+    validate(need(
+      !identical(input$prom_compare %||% "overall", "overall"),
+      "Choose a grouping under Compare scores by to draw a funnel plot."
+    ))
+
+    parts <- prom_funnel_parts()
+    validate(need(!is.null(parts) && nrow(parts$points) > 0, "No linked rows are available for the selected comparison."))
+
+    points <- parts$points
+    outcome <- prom_monitor_outcome()
+    label <- friendly_group_label(input$prom_compare %||% "overall")
+
+    # A smooth grid of volumes so the funnel is drawn as a curve rather than
+    # only at the volumes that happen to occur.
+    n_grid <- unique(round(seq(1, max(points$n), length.out = 300)))
+    bands <- lapply(prom_monitor_alphas(), function(alpha) {
+      band <- if (parts$binary) {
+        funnel_limits_proportion(n_grid, parts$centre / 100, alpha)
+      } else {
+        funnel_limits_mean(n_grid, parts$centre, parts$spread, alpha)
+      }
+      if (nrow(band) == 0) return(NULL)
+      band$label <- if (alpha == 0.05) "95%" else "99.8%"
+      band
+    })
+    bands <- bind_rows(bands[!vapply(bands, is.null, logical(1))])
+    validate(need(nrow(bands) > 0, "Control limits could not be computed for this outcome."))
+
+    flagged <- funnel_flag_points(points, parts$centre, parts$spread, parts$binary, min(prom_monitor_alphas()))
+    points$outside <- flagged$position[match(points$.group_value, flagged$.group_value)] != "Within limits"
+    points$outside[is.na(points$outside)] <- FALSE
+
+    ggplot() +
+      geom_line(data = bands, aes(x = n, y = lower, linetype = label), colour = "#94a3b8") +
+      geom_line(data = bands, aes(x = n, y = upper, linetype = label), colour = "#94a3b8") +
+      geom_hline(yintercept = parts$centre, colour = "#0f172a", linewidth = 0.6) +
+      geom_point(data = points, aes(x = n, y = value, colour = outside), size = 3) +
+      # ggrepel gives much better label placement on a funnel, but it is not one
+      # of the app's declared dependencies, so fall back rather than fail.
+      (if (requireNamespace("ggrepel", quietly = TRUE)) {
+        ggrepel::geom_text_repel(
+          data = points,
+          aes(x = n, y = value, label = .group_value),
+          size = 3.2, colour = "#334155", max.overlaps = 20, seed = 1
+        )
+      } else {
+        geom_text(
+          data = points,
+          aes(x = n, y = value, label = .group_value),
+          size = 3.2, colour = "#334155", hjust = -0.1, vjust = -0.6
+        )
+      }) +
+      scale_colour_manual(values = c(`TRUE` = "#b91c1c", `FALSE` = "#1d4ed8"), guide = "none") +
+      labs(
+        title = paste(prom_monitor_label(outcome), "by", tolower(label)),
+        subtitle = "Solid line = pooled cohort value; dashed lines = control limits",
+        x = "Paired cases in group",
+        y = paste0(prom_monitor_label(outcome), if (parts$binary) " (%)" else ""),
+        linetype = NULL
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(legend.position = "top")
+  })
+
+  prom_funnel_table_data <- reactive({
+    parts <- prom_funnel_parts()
+    if (is.null(parts)) return(data.frame())
+
+    outcome <- prom_monitor_outcome()
+    digits <- if (prom_monitor_is_binary(outcome)) 1 else prom_score_digits(input$prom_type)
+    label <- friendly_group_label(input$prom_compare %||% "overall")
+
+    rows <- lapply(prom_monitor_alphas(), function(alpha) {
+      flagged <- funnel_flag_points(parts$points, parts$centre, parts$spread, parts$binary, alpha)
+      if (nrow(flagged) == 0) return(NULL)
+      flagged$Limits <- if (alpha == 0.05) "95%" else "99.8%"
+      flagged
+    })
+    rows <- bind_rows(rows[!vapply(rows, is.null, logical(1))])
+    if (nrow(rows) == 0) return(data.frame())
+
+    out <- rows %>%
+      transmute(
+        Group = .group_value,
+        `Paired cases` = n,
+        Value = round(value, digits),
+        Limits,
+        `Lower limit` = round(lower, digits),
+        `Upper limit` = round(upper, digits),
+        Position = position
+      ) %>%
+      arrange(desc(`Paired cases`), Limits)
+
+    names(out)[names(out) == "Group"] <- label
+    out
+  })
+
+  output$prom_funnel_table <- renderDT({
+    datatable_or_message(
+      prom_funnel_table_data(),
+      "Choose a grouping under Compare scores by to draw a funnel plot."
+    )
+  })
+
+  # -- CUSUM -----------------------------------------------------------------
+
+  prom_cusum_observed_rate <- reactive({
+    outcome <- prom_monitor_outcome()
+    if (!prom_monitor_is_binary(outcome)) return(NA_real_)
+    df <- prom_monitor_base()
+    values <- df[[outcome]]
+    values <- values[!is.na(values)]
+    if (!length(values)) return(NA_real_)
+    # CUSUM monitors failures, so the baseline is the rate of NOT achieving it.
+    1 - mean(values)
+  })
+
+  output$prom_cusum_baseline_ui <- renderUI({
+    observed <- prom_cusum_observed_rate()
+    if (is.na(observed)) {
+      return(tags$p(class = "help-note", "The CUSUM monitors a yes/no outcome; pick Met PASS or Met MCID above."))
+    }
+    numericInput(
+      "prom_cusum_baseline",
+      "CUSUM: baseline failure rate",
+      value = round(observed, 3),
+      min = 0.001, max = 0.999, step = 0.01
+    )
+  })
+
+  prom_cusum_baseline <- reactive({
+    value <- suppressWarnings(as.numeric(input$prom_cusum_baseline))
+    if (length(value) != 1 || is.na(value) || value <= 0 || value >= 1) {
+      return(prom_cusum_observed_rate())
+    }
+    value
+  })
+
+  prom_cusum_params <- reactive({
+    odds_ratio <- suppressWarnings(as.numeric(input$prom_cusum_or))
+    limit <- suppressWarnings(as.numeric(input$prom_cusum_limit))
+    list(
+      odds_ratio = if (length(odds_ratio) != 1 || is.na(odds_ratio) || odds_ratio <= 1) 2 else odds_ratio,
+      limit = if (length(limit) != 1 || is.na(limit) || limit <= 0) 5 else limit
+    )
+  })
+
+  prom_cusum_data <- reactive({
+    req(input$prom_type)
+    outcome <- prom_monitor_outcome()
+    if (!prom_monitor_is_binary(outcome)) return(data.frame())
+
+    p0 <- prom_cusum_baseline()
+    if (is.na(p0)) return(data.frame())
+
+    params <- prom_cusum_params()
+    compare_col <- input$prom_compare %||% "overall"
+
+    df <- prom_monitor_base() %>% filter(!is.na(.data[[outcome]]))
+    if (nrow(df) == 0) return(data.frame())
+
+    df$case_date <- dplyr::coalesce(df$analysis_date, df$followup_date, df$preop_date)
+    df <- df %>% filter(!is.na(case_date))
+    if (nrow(df) == 0) return(data.frame())
+
+    if (identical(compare_col, "overall")) {
+      df$.group_value <- "All filtered cases"
+    } else {
+      df <- expand_group_column(df, compare_col)
+      if (nrow(df) == 0) return(data.frame())
+    }
+
+    df %>%
+      group_by(.group_value) %>%
+      arrange(case_date, FORM_RESPONSE_GROUP_ID, .by_group = TRUE) %>%
+      group_modify(function(group_df, key) {
+        chart <- bernoulli_cusum(
+          !group_df[[outcome]],
+          p0 = p0,
+          odds_ratio = params$odds_ratio,
+          limit = params$limit
+        )
+        if (nrow(chart) == 0) return(group_df[0, , drop = FALSE])
+        group_df %>%
+          mutate(
+            case_sequence = chart$index,
+            cusum_upper = chart$upper,
+            cusum_lower = chart$lower,
+            signal_up = chart$signal_up,
+            signal_down = chart$signal_down
+          )
+      }) %>%
+      ungroup()
+  })
+
+  output$prom_cusum_note <- renderUI({
+    outcome <- prom_monitor_outcome()
+    if (!prom_monitor_is_binary(outcome)) {
+      return(tags$div(
+        class = "notice-box",
+        sprintf(
+          "The CUSUM here monitors a yes/no outcome. %s is a continuous measure — pick Met PASS or Met MCID to chart it, or read the funnel plot above, which handles both.",
+          prom_monitor_label(outcome)
+        )
+      ))
+    }
+
+    p0 <- prom_cusum_baseline()
+    params <- prom_cusum_params()
+    if (is.na(p0)) {
+      return(tags$div(class = "notice-box", "No cases with a recorded outcome under the current filters."))
+    }
+
+    arl <- cusum_in_control_arl(p0, params$odds_ratio, params$limit)
+    arl_text <- if (is.na(arl)) {
+      "more than 20,000 cases"
+    } else {
+      paste(format(arl, big.mark = ","), "cases")
+    }
+
+    tags$p(
+      class = "help-note",
+      sprintf(
+        "Monitoring failure to achieve %s, baseline failure rate %s%%, tuned to detect the failure odds rising (upper) or falling (lower) by a factor of %s, signalling at h = %s. If the true rate never moved, a false signal would still be expected roughly every %s — read that before acting on a crossing.",
+        prom_monitor_label(outcome),
+        round(100 * p0, 1),
+        params$odds_ratio,
+        params$limit,
+        arl_text
+      )
+    )
+  })
+
+  output$prom_cusum_plot <- renderPlot({
+    req(input$prom_type)
+    outcome <- prom_monitor_outcome()
+    validate(need(
+      prom_monitor_is_binary(outcome),
+      "The CUSUM monitors a yes/no outcome — pick Met PASS or Met MCID."
+    ))
+
+    df <- prom_cusum_data()
+    validate(need(nrow(df) > 0, "No cases with a recorded outcome under the current filters."))
+
+    params <- prom_cusum_params()
+    compare_col <- input$prom_compare %||% "overall"
+    single_series <- identical(compare_col, "overall")
+
+    if (!single_series) {
+      top_groups <- df %>%
+        count(.group_value, name = "cases") %>%
+        arrange(desc(cases)) %>%
+        slice_head(n = 8)
+      df <- df %>% filter(.group_value %in% top_groups$.group_value)
+      validate(need(nrow(df) > 0, "No group has cases for this outcome."))
+    }
+
+    plot_df <- df %>%
+      select(.group_value, case_sequence, cusum_upper, cusum_lower) %>%
+      tidyr::pivot_longer(
+        c(cusum_upper, cusum_lower),
+        names_to = "Direction",
+        values_to = "Value"
+      ) %>%
+      mutate(
+        Direction = factor(
+          ifelse(Direction == "cusum_upper", "Upper: worsening", "Lower: improving"),
+          levels = c("Upper: worsening", "Lower: improving")
+        )
+      )
+
+    limit_df <- data.frame(
+      Direction = factor(
+        c("Upper: worsening", "Lower: improving"),
+        levels = c("Upper: worsening", "Lower: improving")
+      ),
+      limit = c(params$limit, -params$limit)
+    )
+
+    p <- ggplot(plot_df, aes(x = case_sequence, y = Value))
+
+    if (single_series) {
+      p <- p + geom_line(linewidth = 0.8, colour = "#1d4ed8")
+    } else {
+      p <- p + geom_line(aes(colour = .group_value), linewidth = 0.7) + labs(colour = NULL)
+    }
+
+    signal_df <- df %>%
+      select(.group_value, case_sequence, cusum_upper, cusum_lower, signal_up, signal_down) %>%
+      tidyr::pivot_longer(
+        c(cusum_upper, cusum_lower),
+        names_to = "Direction",
+        values_to = "Value"
+      ) %>%
+      mutate(
+        is_signal = ifelse(Direction == "cusum_upper", signal_up, signal_down),
+        Direction = factor(
+          ifelse(Direction == "cusum_upper", "Upper: worsening", "Lower: improving"),
+          levels = c("Upper: worsening", "Lower: improving")
+        )
+      ) %>%
+      filter(is_signal)
+
+    p <- p +
+      geom_hline(data = limit_df, aes(yintercept = limit), linetype = "dashed", colour = "#b91c1c") +
+      geom_hline(yintercept = 0, colour = "#cbd5e1")
+
+    if (nrow(signal_df) > 0) {
+      p <- p + geom_point(
+        data = signal_df,
+        aes(x = case_sequence, y = Value),
+        colour = "#b91c1c", size = 2, shape = 4, stroke = 1.1
+      )
+    }
+
+    p +
+      facet_wrap(~Direction, ncol = 2, scales = "free_y") +
+      labs(
+        title = paste("CUSUM:", prom_monitor_label(outcome)),
+        subtitle = sprintf(
+          "Cases ordered by procedure date. Crosses mark signals; the chart resets to zero after each one (h = %s)",
+          params$limit
+        ),
+        x = "Case sequence",
+        y = "Cumulative log-likelihood ratio"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        legend.position = if (single_series) "none" else "top",
+        panel.spacing = grid::unit(1, "lines")
+      )
+  })
+
+  output$prom_cusum_table <- renderDT({
+    outcome <- prom_monitor_outcome()
+    if (!prom_monitor_is_binary(outcome)) {
+      return(datatable_or_message(data.frame(), "Pick Met PASS or Met MCID to run a CUSUM."))
+    }
+
+    df <- prom_cusum_data()
+    if (nrow(df) == 0) {
+      return(datatable_or_message(data.frame(), "No cases with a recorded outcome under the current filters."))
+    }
+
+    label <- friendly_group_label(input$prom_compare %||% "overall")
+
+    out <- df %>%
+      group_by(.group_value) %>%
+      summarise(
+        Cases = dplyr::n(),
+        `Outcome achieved (%)` = round(100 * mean(.data[[outcome]], na.rm = TRUE), 1),
+        `Peak upper` = round(max(cusum_upper, na.rm = TRUE), 2),
+        `Worsening signals` = sum(signal_up, na.rm = TRUE),
+        `First worsening signal` = if (any(signal_up)) min(case_sequence[signal_up]) else NA_integer_,
+        `Lowest lower` = round(min(cusum_lower, na.rm = TRUE), 2),
+        `Improving signals` = sum(signal_down, na.rm = TRUE),
+        `First improving signal` = if (any(signal_down)) min(case_sequence[signal_down]) else NA_integer_,
+        .groups = "drop"
+      ) %>%
+      arrange(desc(Cases))
+
+    names(out)[names(out) == ".group_value"] <- label
+    datatable_or_message(out)
+  })
 
   output$peri_comp_date_ui <- renderUI({
     bounds <- date_bounds(prepare_periop_complication_data(input$peri_comp_source %||% "all")$analysis_date)
@@ -3369,6 +4867,303 @@ server <- function(input, output, session) {
 
     df
   })
+
+  # ---------------------------------------------------------------------------
+  # Surgical times: rolling trend
+  # ---------------------------------------------------------------------------
+
+  surg_trend_max_window <- reactive({
+    n <- nrow(filtered_surgical())
+    if (n < 10) return(0L)
+    as.integer(min(400, floor(n / 2)))
+  })
+
+  output$surg_trend_window_ui <- renderUI({
+    max_window <- surg_trend_max_window()
+    if (max_window < 5) {
+      return(tags$p(class = "help-note", "Not enough timed cases to draw a rolling trend."))
+    }
+    sliderInput(
+      "surg_trend_window",
+      "Rolling window (cases)",
+      min = 5, max = max_window,
+      value = max(5L, min(50L, max_window)), step = 5
+    )
+  })
+
+  surg_trend_window <- reactive({
+    max_window <- surg_trend_max_window()
+    if (max_window < 5) return(NA_integer_)
+    value <- suppressWarnings(as.integer(input$surg_trend_window))
+    if (length(value) != 1 || is.na(value)) return(max(5L, min(50L, max_window)))
+    max(5L, min(value, max_window))
+  })
+
+  surg_long_threshold <- reactive({
+    value <- suppressWarnings(as.numeric(input$surg_long_threshold))
+    if (length(value) != 1 || is.na(value) || value <= 0) 120 else value
+  })
+
+  surg_trend_data <- reactive({
+    window <- surg_trend_window()
+    if (is.na(window)) return(data.frame())
+
+    df <- filtered_surgical() %>%
+      filter(!is.na(surgical_duration_mins), !is.na(analysis_date))
+    if (nrow(df) == 0) return(data.frame())
+
+    threshold <- surg_long_threshold()
+    df$is_long <- df$surgical_duration_mins > threshold
+
+    compare_col <- input$surg_compare %||% "overall"
+    if (identical(compare_col, "overall")) {
+      df$.group_value <- "All filtered cases"
+    } else {
+      df <- expand_group_column(df, compare_col)
+      if (nrow(df) == 0) return(data.frame())
+    }
+
+    df %>%
+      group_by(.group_value) %>%
+      arrange(analysis_date, FORM_RESPONSE_GROUP_ID, .by_group = TRUE) %>%
+      mutate(
+        case_sequence = dplyr::row_number(),
+        group_cases = dplyr::n(),
+        `Mean duration` = rolling_mean(surgical_duration_mins, window),
+        `Median duration` = rolling_stat(surgical_duration_mins, window, function(v) stats::median(v, na.rm = TRUE)),
+        `Variability (SD)` = rolling_stat(surgical_duration_mins, window, function(v) stats::sd(v, na.rm = TRUE)),
+        `Long cases (%)` = rolling_percent(is_long, window)
+      ) %>%
+      ungroup()
+  })
+
+  surg_trend_metric_labels <- function(selected) {
+    labels <- c(
+      mean = "Mean duration",
+      median = "Median duration",
+      sd = "Variability (SD)",
+      long = "Long cases (%)"
+    )
+    unname(labels[selected[selected %in% names(labels)]])
+  }
+
+  surg_trend_long <- reactive({
+    df <- surg_trend_data()
+    present <- surg_trend_metric_labels(input$surg_trend_metrics %||% character(0))
+    present <- present[present %in% names(df)]
+    if (nrow(df) == 0 || !length(present)) return(data.frame())
+
+    df %>%
+      select(.group_value, case_sequence, analysis_date, group_cases, all_of(present)) %>%
+      tidyr::pivot_longer(all_of(present), names_to = "Metric", values_to = "Value") %>%
+      filter(!is.na(Value)) %>%
+      mutate(Metric = factor(Metric, levels = present))
+  })
+
+  output$surg_trend_note <- renderUI({
+    window <- surg_trend_window()
+    if (is.na(window)) {
+      return(tags$div(
+        class = "notice-box",
+        "Fewer than 10 timed cases under the current filters, so there is nothing to trend. Widen the date range or clear a filter."
+      ))
+    }
+
+    df <- surg_trend_data()
+    if (nrow(df) == 0) {
+      return(tags$div(class = "notice-box", "No timed cases are available for the selected comparison."))
+    }
+
+    short_groups <- df %>%
+      distinct(.group_value, group_cases) %>%
+      filter(group_cases < window)
+
+    messages <- sprintf(
+      "Rolling average of %s cases, ordered by procedure date, over %s timed cases. Long cases are those over %s minutes.",
+      window, format(nrow(df), big.mark = ","), surg_long_threshold()
+    )
+
+    if (nrow(short_groups) > 0) {
+      messages <- c(
+        messages,
+        sprintf(
+          "%s group(s) have fewer than %s cases and so produce no line: %s.",
+          nrow(short_groups), window,
+          paste(utils::head(as.character(short_groups$.group_value), 5), collapse = ", ")
+        )
+      )
+    }
+
+    tags$div(
+      class = if (nrow(short_groups) > 0) "notice-box" else "success-box",
+      tags$ul(lapply(messages, tags$li))
+    )
+  })
+
+  output$surg_trend_boxes <- renderUI({
+    df <- surg_trend_data()
+    window <- surg_trend_window()
+    if (nrow(df) == 0 || is.na(window)) return(NULL)
+
+    overall <- df %>% arrange(analysis_date, FORM_RESPONSE_GROUP_ID)
+    first_window <- utils::head(overall, window)
+    last_window <- utils::tail(overall, window)
+
+    shift_box <- function(title, first_value, last_value, digits, suffix = "") {
+      delta <- last_value - first_value
+      metric_box(
+        title,
+        paste0(round(last_value, digits), suffix),
+        sprintf(
+          "%s%s%s vs first %s cases (%s%s)",
+          if (is.na(delta)) "" else if (delta > 0) "+" else "",
+          if (is.na(delta)) "NA" else round(delta, digits),
+          suffix, window, round(first_value, digits), suffix
+        )
+      )
+    }
+
+    fluidRow(
+      column(3, shift_box("Mean duration", mean(first_window$surgical_duration_mins, na.rm = TRUE), mean(last_window$surgical_duration_mins, na.rm = TRUE), 1, " min")),
+      column(3, shift_box("Median duration", stats::median(first_window$surgical_duration_mins, na.rm = TRUE), stats::median(last_window$surgical_duration_mins, na.rm = TRUE), 1, " min")),
+      column(3, shift_box("Variability (SD)", stats::sd(first_window$surgical_duration_mins, na.rm = TRUE), stats::sd(last_window$surgical_duration_mins, na.rm = TRUE), 1, " min")),
+      column(3, shift_box("Long cases", 100 * mean(first_window$is_long, na.rm = TRUE), 100 * mean(last_window$is_long, na.rm = TRUE), 1, "%"))
+    )
+  })
+
+  output$surg_trend_plot <- renderPlot({
+    plot_df <- surg_trend_long()
+    validate(need(nrow(plot_df) > 0, "Select at least one metric, and make sure enough timed cases exist for the chosen window."))
+
+    compare_col <- input$surg_compare %||% "overall"
+    single_series <- identical(compare_col, "overall")
+    window <- surg_trend_window()
+
+    if (!single_series) {
+      top_groups <- plot_df %>%
+        distinct(.group_value, group_cases) %>%
+        arrange(desc(group_cases)) %>%
+        slice_head(n = 8)
+      plot_df <- plot_df %>% filter(.group_value %in% top_groups$.group_value)
+      validate(need(nrow(plot_df) > 0, "No group has enough cases for the chosen window."))
+    }
+
+    x_by_date <- identical(input$surg_trend_xaxis %||% "sequence", "date")
+    plot_df$x <- if (x_by_date) plot_df$analysis_date else plot_df$case_sequence
+
+    cohort <- surg_trend_data()
+    reference_df <- data.frame(
+      Metric = c("Mean duration", "Median duration", "Variability (SD)", "Long cases (%)"),
+      Value = c(
+        mean(cohort$surgical_duration_mins, na.rm = TRUE),
+        stats::median(cohort$surgical_duration_mins, na.rm = TRUE),
+        stats::sd(cohort$surgical_duration_mins, na.rm = TRUE),
+        100 * mean(cohort$is_long, na.rm = TRUE)
+      ),
+      stringsAsFactors = FALSE
+    ) %>%
+      filter(Metric %in% levels(plot_df$Metric), is.finite(Value)) %>%
+      mutate(Metric = factor(Metric, levels = levels(plot_df$Metric)))
+
+    p <- ggplot(plot_df, aes(x = x, y = Value))
+
+    if (nrow(reference_df) > 0) {
+      p <- p + geom_hline(
+        data = reference_df, aes(yintercept = Value),
+        linetype = "dashed", colour = "#94a3b8", linewidth = 0.6
+      )
+    }
+
+    p <- if (single_series) {
+      p + geom_line(linewidth = 0.8, colour = "#1d4ed8")
+    } else {
+      p + geom_line(aes(colour = .group_value), linewidth = 0.7) + labs(colour = NULL)
+    }
+
+    p +
+      facet_wrap(~Metric, ncol = 2, scales = "free_y") +
+      labs(
+        title = sprintf("Rolling average of %s cases", window),
+        subtitle = "Surgical duration, cases ordered by procedure date",
+        x = if (x_by_date) "Procedure date of most recent case in window" else "Case sequence",
+        y = NULL,
+        caption = paste0(
+          "Dashed line = mean across all filtered cases.",
+          if (!single_series && !x_by_date) " Each series is numbered from its own first case, so series are not aligned in time — switch to procedure date to compare calendar periods." else ""
+        )
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        legend.position = if (single_series) "none" else "top",
+        panel.spacing = grid::unit(1, "lines"),
+        plot.caption = element_text(colour = "#64748b", hjust = 0)
+      )
+  })
+
+  output$surg_trend_shift_table <- renderDT({
+    df <- surg_trend_data()
+    window <- surg_trend_window()
+    if (nrow(df) == 0 || is.na(window)) {
+      return(datatable_or_message(data.frame(), "Not enough timed cases for the chosen window."))
+    }
+
+    out <- df %>%
+      group_by(.group_value) %>%
+      arrange(analysis_date, FORM_RESPONSE_GROUP_ID, .by_group = TRUE) %>%
+      filter(dplyr::n() >= window) %>%
+      summarise(
+        Cases = dplyr::n(),
+        `First window: mean` = round(mean(utils::head(surgical_duration_mins, window), na.rm = TRUE), 1),
+        `Latest window: mean` = round(mean(utils::tail(surgical_duration_mins, window), na.rm = TRUE), 1),
+        `First window: median` = round(stats::median(utils::head(surgical_duration_mins, window), na.rm = TRUE), 1),
+        `Latest window: median` = round(stats::median(utils::tail(surgical_duration_mins, window), na.rm = TRUE), 1),
+        `First window: long (%)` = round(100 * mean(utils::head(is_long, window), na.rm = TRUE), 1),
+        `Latest window: long (%)` = round(100 * mean(utils::tail(is_long, window), na.rm = TRUE), 1),
+        .groups = "drop"
+      ) %>%
+      rename_group_column(friendly_group_label(input$surg_compare %||% "overall"))
+
+    datatable_or_message(out, "Not enough timed cases for the chosen window.")
+  })
+
+  surg_trend_display <- reactive({
+    df <- surg_trend_data()
+    if (nrow(df) == 0) return(data.frame())
+
+    group_label <- friendly_group_label(input$surg_compare %||% "overall")
+
+    out <- data.frame(
+      Series = as.character(df$.group_value),
+      `Case sequence` = df$case_sequence,
+      `Procedure date` = as.character(df$analysis_date),
+      FORM_RESPONSE_GROUP_ID = df$FORM_RESPONSE_GROUP_ID,
+      Joint = df$Joint,
+      Consultant = df$consultant,
+      `Duration (mins)` = df$surgical_duration_mins,
+      `Long case` = ifelse(is.na(df$is_long), NA, ifelse(df$is_long, "Yes", "No")),
+      `Rolling mean` = round(df$`Mean duration`, 1),
+      `Rolling median` = round(df$`Median duration`, 1),
+      `Rolling SD` = round(df$`Variability (SD)`, 1),
+      `Rolling long cases (%)` = round(df$`Long cases (%)`, 1),
+      check.names = FALSE,
+      stringsAsFactors = FALSE
+    )
+
+    names(out)[names(out) == "Series"] <- group_label
+    out
+  })
+
+  output$surg_trend_table <- renderDT({
+    datatable_or_message(
+      surg_trend_display(),
+      "No timed cases available for a rolling trend under the current filters."
+    )
+  })
+
+  output$download_surg_trend <- downloadHandler(
+    filename = function() paste0("inor_surgical_trend_", Sys.Date(), ".csv"),
+    content = function(file) write_export(surg_trend_display(), file)
+  )
 
   output$surg_metrics <- renderUI({
     df <- filtered_surgical()

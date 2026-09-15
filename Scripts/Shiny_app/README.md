@@ -9,10 +9,12 @@ This is the **complete app folder**. Keep these together after unzipping:
 
 ## What changed in this revision
 
-The **PROMs** tab is now split into two views:
+The **PROMs** tab is now split into three views:
 
 - **Scores by stage** — the original cross-sectional view (mean score at each stage)
 - **Pre-op vs post-op change** — paired analysis of how much each case actually improved
+- **Trends** — rolling averages over consecutive cases, for monitoring drift over time
+- **Monitoring** — funnel plot and CUSUM, for comparing units and detecting change
 
 ### Pre-op vs post-op change
 
@@ -60,8 +62,165 @@ data at 6 months, 74% met both, but 12% met the MCID while remaining below PASS.
 
 The headline PASS rate and the group comparison use **follow-up records only**.
 Pooling pre-op records (where almost nobody is in an acceptable state) would drag
-every rate down, and would let a group's mix of stages masquerade as a difference
-in outcome. Pre-op still appears in the by-stage breakdown as a reference point.
+every rate down. Pre-op still appears in the by-stage breakdown as a reference
+point.
+
+#### Why the two tabs report different PASS rates
+
+They are correct but measure different cohorts, and the difference is signposted
+in both places:
+
+| | Scores by stage | Pre-op vs post-op change |
+|---|---|---|
+| Stages | every selected follow-up stage, broken out separately | the one selected follow-up stage |
+| Cases | every follow-up record | only cases that also have a pre-op baseline |
+| Repeat submissions | all counted | collapsed to one per case / side / stage |
+
+PASS climbs with time since surgery (79.6% at 6 months, 88.9% at 2 years on the
+knee dummy data), so **never compare a pooled figure against a single-stage one**.
+The group comparison on the Scores by stage tab is therefore broken out by stage
+rather than pooled — otherwise a consultant with proportionally more 2-year
+follow-ups would score better purely through case mix.
+
+Compared stage-for-stage, the two tabs agree to within about 2 percentage points
+on the dummy data. What remains is the paired-only restriction: follow-up records
+with no pre-op baseline count on the Scores by stage tab but cannot appear in a
+paired analysis.
+
+### Trends
+
+A rolling average over consecutive cases, for spotting drift that a single
+pooled number hides.
+
+Cases are ordered by **procedure date** and each point averages that case plus
+the preceding cases in the window, so the x axis is operative sequence rather
+than calendar time. The window is **right-aligned**: a point is never influenced
+by surgery that had not happened yet, and the series only starts once a full
+window exists rather than opening on an average of two or three cases.
+
+Controls:
+
+- **Rolling window (cases)** — 5 up to half the available cases, capped at 400
+- **Metrics to plot** — mean follow-up score, mean pre-op score, mean change,
+  Met MCID (%), PASS rate (%); each gets its own panel with its own y scale
+- **Plot against** — case sequence or procedure date
+- Series split by the **Compare scores by** selection, capped at the 8 groups
+  with the most cases
+
+Alongside the chart:
+
+- metric tiles comparing the **latest window against the first**, per metric
+- a per-series table of the same first-vs-latest comparison
+- the full per-case rolling series, downloadable as CSV
+
+The cohort is the **paired** one — cases with both a pre-op baseline and a score
+at the selected follow-up stage — so every metric on the chart describes the same
+set of patients and the MCID and PASS lines are directly comparable.
+
+Two things to read carefully:
+
+- Grouped by consultant with **case sequence** on the x axis, each series is
+  numbered from its own first case, so the lines are *not* aligned in time. That
+  is what you want for a per-surgeon learning curve; switch to **procedure date**
+  to compare calendar periods.
+- The first-vs-latest table is a crude comparison of two windows, not a test for
+  trend. A window of 50 on a noisy measure will swing several points on chance
+  alone. Read it next to the chart, not instead of it. For a proper test of
+  change over time, use the CUSUM on the Monitoring view.
+
+### Monitoring: funnel plot and CUSUM
+
+Both charts work on the paired cohort at the selected follow-up stage, and both
+carry the same caveat in the app itself.
+
+> **Neither chart adjusts for case mix.** A signal means a group or a run differs
+> from the pooled cohort under the current filters — not that care was worse. A
+> surgeon operating on patients with lower baseline function, more complex
+> deformity, or higher comorbidity drifts towards a signal for those reasons
+> alone. Both are prompts to look, never conclusions.
+
+#### Funnel plot
+
+Each unit (consultant, surgeon grade, fixation type, component — whatever
+**Compare scores by** is set to) is one point: volume on the x axis, outcome on
+the y. Control limits narrow as volume rises, so a small unit has to be far from
+the centre before it means anything.
+
+- Outcomes: Met PASS, Met MCID, mean change, mean follow-up score
+- Limits at 95% and 99.8% (either, or both)
+- Proportions use **exact binomial** limits rather than the normal
+  approximation, which misbehaves badly at the low-volume end of a funnel —
+  exactly where registry units sit. The limit line is stepped as a result; that
+  is honest, not a rendering artefact.
+- Continuous outcomes use the pooled SD, which assumes common variance across
+  units
+- All four outcomes run "higher is better", so a point above the upper limit is
+  flagged as *better* than the cohort, and below the lower limit as *worse*
+
+#### CUSUM
+
+A Bernoulli log-likelihood-ratio CUSUM (Steiner et al., *Biostatistics* 2000),
+monitoring failure to achieve a yes/no outcome — Met PASS or Met MCID. Continuous
+outcomes are not charted; the funnel handles those.
+
+The upper chart accumulates evidence that the failure odds have **risen** by the
+chosen factor, the lower that they have **fallen**. Cases are ordered by
+procedure date. Crossing the control limit `h` raises a signal, and the chart
+**resets to zero** after each one — without the reset a single crossing leaves
+the chart flagged for every later case, so one detection reads as hundreds and
+later changes are masked.
+
+Configurable: the odds ratio to detect (default 2), the control limit `h`
+(default 5), and the baseline failure rate (defaults to the filtered cohort's
+own observed rate).
+
+**Read the false-alarm rate before acting on a crossing.** The app simulates the
+in-control average run length for your settings and states it in plain words —
+"a false signal would still be expected roughly every N cases". That number moves
+a great deal with `h`: at a 20% baseline failure rate and an odds ratio of 2,
+`h = 3` gives a false signal about every 530 cases, `h = 4` about every 1,400,
+`h = 5` about every 4,300, and `h = 6` more than every 20,000. A limit chosen
+without looking at this is arbitrary.
+
+### Patient demographic filters
+
+The PROMs sidebar filters on **sex, age at procedure, and BMI**. These apply to
+every PROMs view — scores by stage, change, trends and monitoring — because they
+sit in the shared filter chain, and a cohort composition line above the tabs
+reports what the current filters actually selected (n, mean age, % female, mean
+BMI, and how many records have no value on file).
+
+Where the values come from matters, because coverage differs:
+
+| Field | Source | Coverage on the dummy data |
+|---|---|---|
+| Sex | the PROM record's own `Sex at Birth`, falling back to the case record | 100% |
+| Age | case record's age at surgery, else computed from the PROM date of birth | 100% |
+| BMI | case record only — PROM extracts carry no BMI | ~85% |
+
+Because BMI is only ~85% covered, each range filter has an explicit **include
+records with no value** checkbox, on by default. A slider alone would silently
+delete every case with nothing on file, which on BMI would quietly drop a sixth
+of the cohort.
+
+Age is age at procedure where the record links to the case table. Where it does
+not, it falls back to age at the PROM event — which for a 5-year review is five
+years older than age at surgery. Same caveat as the date filter.
+
+**Sex, age band and BMI band are also available under Compare scores by**, so
+every existing comparison — mean score, change, MCID, PASS, funnel, CUSUM,
+rolling trend — works across them with no extra controls. Bands are:
+
+- Age: under 50, 50-59, 60-69, 70-79, 80 and over
+- BMI: WHO categories, with the obesity classes kept separate (30-34.9, 35-39.9,
+  40+) because operative risk and PROM gain differ across them
+
+Banded groupings sort in clinical order rather than alphabetically.
+
+On the knee dummy data this immediately shows a PASS gradient across BMI at
+6 months — 84.3% healthy weight, 81.0% overweight, 79.4% obese I, 76.0% obese II,
+68.3% obese III — while mean change stays roughly flat. Patients with higher BMI
+gain about as much, but start and finish lower.
 
 ### Threshold defaults
 
@@ -148,6 +307,35 @@ source("run_app.R")
 - `RawData/` — the dummy CSV files you supplied
 - `reference/Implant_queries.R`
 - `reference/Summary_data.R`
+
+## Surgical times: rolling trend
+
+The **Surgical times** tab is split into two views:
+
+- **Distribution and comparison** — the original histogram, comparison chart and
+  tables
+- **Rolling trend** — a rolling average over consecutive cases, the same
+  mechanism as the PROMs Trends view
+
+Cases are ordered by procedure date and each point averages that case plus the
+preceding cases in the window. The window is right-aligned, so no point is
+influenced by an operation that had not happened yet, and a series only starts
+once a full window exists.
+
+Metrics: mean duration, median duration, variability (SD), and the percentage of
+**long cases** over a threshold you set (default 120 minutes). Median and SD are
+worth watching alongside the mean — a stable mean with rising SD means the
+list has become less predictable even though average theatre time has not moved.
+
+Controls mirror the PROMs trend: window size in cases, which metrics to plot,
+case sequence or procedure date on the x axis, and series split by the
+**Compare duration by** selection. Metric tiles compare the latest window against
+the first, and the full per-case rolling series downloads as CSV.
+
+The same caution applies as on the PROMs trend: grouped by consultant with case
+sequence on the x axis, each series is numbered from its own first case, so the
+lines are not aligned in time. That is what you want for a per-surgeon learning
+curve; switch to procedure date to compare calendar periods.
 
 ## Complication rates: denominator used
 
